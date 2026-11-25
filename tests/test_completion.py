@@ -116,6 +116,148 @@ class TestCompletion(unittest.TestCase):
         vr_sub = {"name": "多版本剧", "type": "电视剧", "season": 1, "version_rules": [{"name": "4K"}]}
         self.assertEqual(evaluate_subscription_completion(vr_sub).reason, "skip_version_rules")
 
+    def test_previous_season_eligible_when_next_season_scheduled_in_future(self) -> None:
+        sub = {"name": "多季示例剧", "type": "电视剧", "season": 3, "tmdbid": 1007}
+        media = {
+            "status": "Returning Series",
+            "number_of_seasons": 4,
+            "next_episode_to_air": {"season_number": 4, "episode_number": 1, "air_date": "2025-02-01"},
+            "season_info": [
+                {"season_number": 3, "episode_count": 8, "air_date": "2024-01-10"},
+                {"season_number": 4, "episode_count": 8, "air_date": "2025-02-01"},
+            ],
+        }
+        res = evaluate_subscription_completion(sub, media, today=date(2025, 1, 15))
+        self.assertTrue(res.eligible)
+        self.assertEqual(res.reason, "tv_previous_season_completed")
+        self.assertEqual(res.expected_episodes, 8)
+
+    def test_previous_season_not_eligible_when_target_season_not_started_yet(self) -> None:
+        sub = {"name": "未来季示例剧", "type": "电视剧", "season": 3, "tmdbid": 1008}
+        media = {
+            "status": "Returning Series",
+            "number_of_seasons": 4,
+            "next_episode_to_air": {"season_number": 4, "episode_number": 1, "air_date": "2025-04-01"},
+            "season_info": [
+                {"season_number": 3, "episode_count": 8, "air_date": "2025-03-01"},
+                {"season_number": 4, "episode_count": 8, "air_date": "2025-04-01"},
+            ],
+        }
+        res = evaluate_subscription_completion(sub, media, today=date(2025, 1, 15))
+        self.assertFalse(res.eligible)
+        self.assertEqual(res.reason, "tv_ongoing_status:returning series")
+
+    def test_latest_season_quiet_completed_is_eligible(self) -> None:
+        sub = {"name": "连载示例剧", "type": "电视剧", "season": 4, "tmdbid": 1009}
+        media = {
+            "status": "Returning Series",
+            "number_of_seasons": 4,
+            "last_air_date": "2024-11-01",
+            "next_episode_to_air": None,
+            "season_info": [
+                {"season_number": 3, "episode_count": 8, "air_date": "2023-01-01"},
+                {"season_number": 4, "episode_count": 8, "air_date": "2024-09-01"},
+            ],
+        }
+        res = evaluate_subscription_completion(sub, media, today=date(2025, 1, 1))
+        self.assertTrue(res.eligible)
+        self.assertEqual(res.reason, "tv_latest_season_quiet_completed")
+        self.assertEqual(res.expected_episodes, 8)
+
+    def test_latest_season_recent_air_date_passes_through_to_pt(self) -> None:
+        sub = {"name": "连载示例剧", "type": "电视剧", "season": 4, "tmdbid": 1010}
+        media = {
+            "status": "Returning Series",
+            "number_of_seasons": 4,
+            "last_air_date": "2024-12-22",
+            "next_episode_to_air": None,
+            "season_info": [
+                {"season_number": 4, "episode_count": 8, "air_date": "2024-10-01"},
+            ],
+        }
+        res = evaluate_subscription_completion(sub, media, today=date(2025, 1, 1))
+        self.assertFalse(res.eligible)
+        self.assertEqual(res.reason, "tv_ongoing_status:returning series")
+
+    def test_unstarted_future_season_passes_through_to_pt(self) -> None:
+        sub = {"name": "未开播示例剧", "type": "电视剧", "season": 5, "tmdbid": 1011}
+        media = {
+            "status": "Returning Series",
+            "number_of_seasons": 5,
+            "last_air_date": "2024-06-01",
+            "next_episode_to_air": None,
+            "season_info": [
+                {"season_number": 4, "episode_count": 8, "air_date": "2024-04-01"},
+                {"season_number": 5, "episode_count": 8, "air_date": "2025-02-01"},
+            ],
+        }
+        res = evaluate_subscription_completion(sub, media, today=date(2025, 1, 1))
+        self.assertFalse(res.eligible)
+        self.assertEqual(res.reason, "tv_ongoing_status:returning series")
+
+    def test_latest_season_quiet_disabled_passes_through_to_pt(self) -> None:
+        sub = {"name": "连载示例剧", "type": "电视剧", "season": 4, "tmdbid": 1012}
+        media = {
+            "status": "Returning Series",
+            "number_of_seasons": 4,
+            "last_air_date": "2024-11-01",
+            "next_episode_to_air": None,
+            "season_info": [
+                {"season_number": 4, "episode_count": 8, "air_date": "2024-09-01"},
+            ],
+        }
+        res = evaluate_subscription_completion(
+            sub,
+            media,
+            allow_completed_latest_season=False,
+            today=date(2025, 1, 1),
+        )
+        self.assertFalse(res.eligible)
+        self.assertEqual(res.reason, "tv_ongoing_status:returning series")
+
+    def test_latest_season_quiet_days_none_or_empty_falls_back_to_30(self) -> None:
+        sub = {"name": "静默天数回退剧", "type": "电视剧", "season": 4, "tmdbid": 1013}
+        media = {
+            "status": "Returning Series",
+            "number_of_seasons": 4,
+            "last_air_date": "2024-11-01",
+            "next_episode_to_air": None,
+            "season_info": [
+                {"season_number": 4, "episode_count": 8, "air_date": "2024-09-01"},
+            ],
+        }
+        for bad_days in (None, "", "invalid", float("inf"), float("-inf")):
+            res = evaluate_subscription_completion(
+                sub,
+                media,
+                allow_completed_latest_season=True,
+                latest_season_quiet_days=bad_days,  # type: ignore[arg-type]
+                today=date(2025, 1, 1),
+            )
+            self.assertTrue(res.eligible)
+            self.assertEqual(res.reason, "tv_latest_season_quiet_completed")
+
+        # Verify threshold genuinely falls back to 30 (not 7): 22 days since last_air_date must stay passthrough
+        recent_media = {
+            "status": "Returning Series",
+            "number_of_seasons": 4,
+            "last_air_date": "2024-12-10",
+            "next_episode_to_air": None,
+            "season_info": [
+                {"season_number": 4, "episode_count": 8, "air_date": "2024-10-01"},
+            ],
+        }
+        for inf_days in (float("inf"), float("-inf")):
+            res_recent = evaluate_subscription_completion(
+                sub,
+                recent_media,
+                allow_completed_latest_season=True,
+                latest_season_quiet_days=inf_days,  # type: ignore[arg-type]
+                today=date(2025, 1, 1),
+            )
+            self.assertFalse(res_recent.eligible)
+            self.assertEqual(res_recent.reason, "tv_ongoing_status:returning series")
+
 
 if __name__ == "__main__":
     unittest.main()

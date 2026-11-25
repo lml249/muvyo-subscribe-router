@@ -129,6 +129,21 @@ except ImportError:  # pragma: no cover - MoviePilot V2 compatibility or standal
                 return {"username": "admin"}
 
 
+def _parse_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"false", "0", "no", "off", ""}:
+        return False
+    if text in {"true", "1", "yes", "on"}:
+        return True
+    return default
+
+
 def _split_csv(value: Any) -> List[str]:
     if isinstance(value, list):
         return [str(v).strip() for v in value if str(v).strip()]
@@ -143,7 +158,7 @@ class MuvyoSubscribeRouter(_PluginBase):
     plugin_name = "Muvyo 完结订阅分流"
     plugin_desc = "监听 MoviePilot 新增订阅，对已完结剧集（及可选电影）优先通过外置 Muvyo/MV3 盘搜、115 转存、内封中文字幕门禁与整理生成 STRM，失败无缝回退 PT。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/cloud.png"
-    plugin_version = "0.1"
+    plugin_version = "0.2"
     plugin_author = "lml249"
     author_url = "https://github.com/lml249/muvyo-subscribe-router"
     plugin_config_prefix = "muvyosubscriberouter_"
@@ -161,6 +176,8 @@ class MuvyoSubscribeRouter(_PluginBase):
         self._handle_movies: bool = False
         self._skip_best_version: bool = True
         self._skip_version_rules: bool = True
+        self._allow_completed_latest_season: bool = True
+        self._latest_season_quiet_days: int = 30
         self._user_allowlist: List[str] = []
         self._user_blocklist: List[str] = []
         self._staging_root: str = "/未整理/mp-router"
@@ -190,16 +207,25 @@ class MuvyoSubscribeRouter(_PluginBase):
     def init_plugin(self, config: Optional[Dict[str, Any]] = None) -> None:
         self.stop_service()
         cfg = config or {}
-        enabled = bool(cfg.get("enabled", False))
+        enabled = _parse_bool(cfg.get("enabled"), False)
         self._mv_base_url = str(cfg.get("mv_base_url") or "").strip().rstrip("/")
         self._mv_api_key = str(cfg.get("mv_api_key") or "").strip()
         scheme = str(cfg.get("mv_auth_scheme") or "x-api-key").strip().lower()
         self._mv_auth_scheme = scheme if scheme in {"x-api-key", "bearer"} else "x-api-key"
         self._mv_storage = str(cfg.get("mv_storage") or "115-default").strip()
         self._mv_timeout = max(5, int(cfg.get("mv_timeout") or 30))
-        self._handle_movies = bool(cfg.get("handle_movies", False))
-        self._skip_best_version = bool(cfg.get("skip_best_version", True))
-        self._skip_version_rules = bool(cfg.get("skip_version_rules", True))
+        self._handle_movies = _parse_bool(cfg.get("handle_movies"), False)
+        self._skip_best_version = _parse_bool(cfg.get("skip_best_version"), True)
+        self._skip_version_rules = _parse_bool(cfg.get("skip_version_rules"), True)
+        self._allow_completed_latest_season = _parse_bool(
+            cfg.get("allow_completed_latest_season"), True
+        )
+        raw_quiet = cfg.get("latest_season_quiet_days")
+        try:
+            quiet_days = int(raw_quiet) if raw_quiet not in (None, "") else 30
+        except (TypeError, ValueError, OverflowError):
+            quiet_days = 30
+        self._latest_season_quiet_days = max(7, min(365, quiet_days))
         self._user_allowlist = _split_csv(cfg.get("user_allowlist"))
         self._user_blocklist = _split_csv(cfg.get("user_blocklist"))
         self._staging_root = str(cfg.get("staging_root") or "/未整理/mp-router").strip()
@@ -213,14 +239,16 @@ class MuvyoSubscribeRouter(_PluginBase):
         self._search_channels = _split_csv(cfg.get("search_channels"))
         self._max_candidates = max(1, min(20, int(cfg.get("max_candidates") or 8)))
         self._max_drill_depth = max(1, min(6, int(cfg.get("max_drill_depth") or 3)))
-        self._trigger_strm_generate = bool(cfg.get("trigger_strm_generate", False))
+        self._trigger_strm_generate = _parse_bool(cfg.get("trigger_strm_generate"), False)
         fail_act = str(cfg.get("on_subtitle_gate_fail") or "keep_paused").strip().lower()
         self._on_subtitle_gate_fail = fail_act if fail_act in {"keep_paused", "fallback_pt"} else "keep_paused"
         ok_act = str(cfg.get("on_success_action") or "complete").strip().lower()
         self._on_success_action = ok_act if ok_act in {"complete", "pause"} else "complete"
-        self._trigger_pt_search_on_fallback = bool(cfg.get("trigger_pt_search_on_fallback", False))
-        self._notify = bool(cfg.get("notify", True))
-        self._dry_run = bool(cfg.get("dry_run", False))
+        self._trigger_pt_search_on_fallback = _parse_bool(
+            cfg.get("trigger_pt_search_on_fallback"), False
+        )
+        self._notify = _parse_bool(cfg.get("notify"), True)
+        self._dry_run = _parse_bool(cfg.get("dry_run"), False)
 
         with self._lock:
             self._stopping = threading.Event()
@@ -354,6 +382,17 @@ class MuvyoSubscribeRouter(_PluginBase):
                     {
                         "component": "VRow",
                         "content": [
+                            {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
+                                {"component": "VSwitch", "props": {"model": "allow_completed_latest_season", "label": "连载剧最新季静默完播分流"}}
+                            ]},
+                            {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
+                                {"component": "VTextField", "props": {"model": "latest_season_quiet_days", "label": "最新季静默完播天数 (7-365)", "type": "number", "placeholder": "30"}}
+                            ]},
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
                             {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
                                 {"component": "VTextField", "props": {"model": "user_allowlist", "label": "用户白名单（逗号分隔，空=全部）"}}
                             ]},
@@ -378,6 +417,8 @@ class MuvyoSubscribeRouter(_PluginBase):
             "handle_movies": False,
             "skip_best_version": True,
             "skip_version_rules": True,
+            "allow_completed_latest_season": True,
+            "latest_season_quiet_days": 30,
             "user_allowlist": "",
             "user_blocklist": "",
             "staging_root": "/未整理/mp-router",
@@ -404,6 +445,7 @@ class MuvyoSubscribeRouter(_PluginBase):
         reviews: List[Dict[str, Any]] = self.get_data("manual_reviews") or []
         routed_ok = sum(1 for item in history if item.get("status") == "routed_ok")
         fallback_cnt = sum(1 for item in history if item.get("status") == "fallback_pt")
+        passthrough_cnt = sum(1 for item in history if item.get("status") == "passthrough_pt")
         review_cnt = len(reviews)
 
         rows = []
@@ -472,13 +514,16 @@ class MuvyoSubscribeRouter(_PluginBase):
             {
                 "component": "VRow",
                 "content": [
-                    {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
+                    {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [
                         {"component": "VAlert", "props": {"type": "success", "variant": "tonal", "text": f"分流成功：{routed_ok}"}}
                     ]},
-                    {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
+                    {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [
                         {"component": "VAlert", "props": {"type": "info", "variant": "tonal", "text": f"回退 PT：{fallback_cnt}"}}
                     ]},
-                    {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
+                    {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [
+                        {"component": "VAlert", "props": {"type": "secondary", "variant": "tonal", "text": f"直接放行 PT：{passthrough_cnt}"}}
+                    ]},
+                    {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [
                         {"component": "VAlert", "props": {"type": "warning", "variant": "tonal", "text": f"待人工复核 (staging)：{review_cnt}"}}
                     ]},
                 ],
@@ -707,6 +752,13 @@ class MuvyoSubscribeRouter(_PluginBase):
                 k: v for k, v in sub_dict.items()
                 if not str(k).startswith("_") and k != "id"
             }
+            for field in ("name", "description"):
+                if isinstance(history_payload.get(field), str) and history_payload[field]:
+                    history_payload[field] = redact_sensitive_text(
+                        history_payload[field],
+                        max_length=0,
+                        extra_secrets=[self._mv_api_key],
+                    )
             history_payload["date"] = _now_iso()
             hist_res = oper.add_history(**history_payload)
             if hist_res is False:
@@ -770,15 +822,34 @@ class MuvyoSubscribeRouter(_PluginBase):
             except Exception:
                 return None
 
+        expected_tmdb_id = int(self._sub_attr(subscribe, "tmdbid") or 0)
         decision = evaluate_subscription_completion(
             subscribe,
             mediainfo,
             handle_movies=self._handle_movies,
             skip_best_version=self._skip_best_version,
             skip_version_rules=self._skip_version_rules,
+            allow_completed_latest_season=self._allow_completed_latest_season,
+            latest_season_quiet_days=self._latest_season_quiet_days,
             tmdb_fallback_fetcher=_tmdb_fallback,
         )
+        safe_title = redact_sensitive_text(decision.title, extra_secrets=[self._mv_api_key])
+        safe_reason = redact_sensitive_text(decision.reason, extra_secrets=[self._mv_api_key])
         if not decision.eligible:
+            logger.info(
+                f"[MuvyoSubscribeRouter] passthrough subscribe #{subscribe_id} "
+                f"({safe_title} S{decision.season:02d}): {safe_reason}"
+            )
+            self._record_history({
+                "timestamp": _now_iso(),
+                "subscribe_id": subscribe_id,
+                "tmdb_id": expected_tmdb_id,
+                "title": decision.title,
+                "season": decision.season,
+                "media_kind": decision.media_kind,
+                "status": "passthrough_pt",
+                "reason": decision.reason,
+            })
             return
 
         with self._lock:
@@ -786,7 +857,11 @@ class MuvyoSubscribeRouter(_PluginBase):
                 return
             self._inflight_sids.add(subscribe_id)
 
-        expected_tmdb_id = int(self._sub_attr(subscribe, "tmdbid") or 0)
+        logger.info(
+            f"[MuvyoSubscribeRouter] routing subscribe #{subscribe_id} "
+            f"({safe_title} S{decision.season:02d}): {safe_reason}, "
+            f"expected_eps={decision.expected_episodes}"
+        )
         # Synchronously pause subscription first to prevent MP PT search race condition
         try:
             oper.update(subscribe_id, {"state": "S"})
@@ -961,7 +1036,7 @@ class MuvyoSubscribeRouter(_PluginBase):
                 "title": decision.title,
                 "season": decision.season,
                 "media_kind": decision.media_kind,
-                **result.to_sanitized_dict(),
+                **result.to_sanitized_dict(extra_secrets=[self._mv_api_key]),
             }
             self._record_history(record)
 
@@ -1092,4 +1167,7 @@ class MuvyoSubscribeRouter(_PluginBase):
             tmdb_id=tmdb_id,
             config=self._build_pipeline_config(dry_run_override=True),
         )
-        return redact_sensitive_data({"ok": res.status == "dry_run_matched", **res.to_sanitized_dict()})
+        return redact_sensitive_data(
+            {"ok": res.status == "dry_run_matched", **res.to_sanitized_dict(extra_secrets=[self._mv_api_key])},
+            extra_secrets=[self._mv_api_key],
+        )

@@ -35,6 +35,115 @@ class TestRedactionAndClient(unittest.TestCase):
         self.assertEqual(redacted["inner"][0]["pickcode"], "[REDACTED]")
         self.assertNotIn("PW1", redacted["inner"][0]["url"])
 
+    def test_redaction_strips_inline_bearer_multiline_cookie_and_share_paths(self) -> None:
+        raw = (
+            "title Bearer inline_jwt.abc123.xyz "
+            "and Authorization: Bearer inline_auth_999 ok\n"
+            "Cookie: UID=u100; CID=c200; SEID=s300\n"
+            "payload cookie=a=1; b=2; c=3 tail_text\n"
+            "inline Cookie: k1=v1; k2=v2; k3=v3 end_text\n"
+            "links https://share.example.local/s/demo_code123 "
+            "https://115.com/s/sw3abc123?password=pwd999&receive_code=rc888 "
+            "https://example.local/share_code/sc_path_777?x=1"
+        )
+        cleaned = redact_sensitive_text(raw)
+        for secret in (
+            "inline_jwt.abc123.xyz",
+            "inline_auth_999",
+            "u100",
+            "c200",
+            "s300",
+            "a=1",
+            "b=2",
+            "c=3",
+            "k1=v1",
+            "k2=v2",
+            "k3=v3",
+            "demo_code123",
+            "sw3abc123",
+            "pwd999",
+            "rc888",
+            "sc_path_777",
+        ):
+            self.assertNotIn(secret, cleaned)
+        self.assertIn("Bearer [REDACTED]", cleaned)
+        self.assertIn("Authorization: [REDACTED]", cleaned)
+        self.assertIn("Cookie: [REDACTED]", cleaned)
+        self.assertIn("cookie=[REDACTED] tail_text", cleaned)
+        self.assertIn("Cookie: [REDACTED] end_text", cleaned)
+        self.assertIn("https://share.example.local/s/[REDACTED]", cleaned)
+        self.assertIn("https://115.com/s/[REDACTED]", cleaned)
+        self.assertIn("https://example.local/share_code/[REDACTED]", cleaned)
+        self.assertNotIn("password=", cleaned)
+        self.assertNotIn("receive_code=", cleaned)
+
+    def test_redaction_strips_quoted_cookies_bare_share_urls_and_multiline_tokens(self) -> None:
+        raw = (
+            'inline Cookie: a="v1"; b=v2 tail_cookie\n'
+            'inline cookie=sid="abc;123"; uid=456 end_cookie\n'
+            "bare share.example.local/s/demo_bare\n"
+            "bare2 115.com/s/sw3demo123\n"
+            "bare3 share.example.local/s/demo123?password=abc\n"
+            "bare4 example.local/share_code/bare_sc777?x=1\n"
+            "password:\nSECRET_NEXT_LINE\n"
+            "token=\nSECRET_TOKEN_LINE\n"
+            "Authorization:\n[REDACTED]\n"
+        )
+        cleaned = redact_sensitive_text(raw)
+        for secret in (
+            "v1",
+            "b=v2",
+            "abc;123",
+            "uid=456",
+            "demo_bare",
+            "sw3demo123",
+            "demo123",
+            "password=abc",
+            "bare_sc777",
+            "SECRET_NEXT_LINE",
+            "SECRET_TOKEN_LINE",
+        ):
+            self.assertNotIn(secret, cleaned)
+        self.assertIn("Cookie: [REDACTED] tail_cookie", cleaned)
+        self.assertIn("cookie=[REDACTED] end_cookie", cleaned)
+        self.assertIn("share.example.local/s/[REDACTED]", cleaned)
+        self.assertIn("115.com/s/[REDACTED]", cleaned)
+        self.assertIn("example.local/share_code/[REDACTED]", cleaned)
+        self.assertIn("password:\n[REDACTED]", cleaned)
+        self.assertIn("token=\n[REDACTED]", cleaned)
+        self.assertIn("Authorization:\n[REDACTED]", cleaned)
+
+    def test_redaction_strips_unquoted_keys_with_quoted_values(self) -> None:
+        raw = (
+            'token="RAW_Q_TOK" '
+            "password='RAW_Q_PWD' "
+            'api_key: "RAW_Q_KEY" '
+            '{token: RAW_BRACE_TOK, next: "ok"}'
+        )
+        cleaned = redact_sensitive_text(raw)
+        for secret in ("RAW_Q_TOK", "RAW_Q_PWD", "RAW_Q_KEY", "RAW_BRACE_TOK"):
+            self.assertNotIn(secret, cleaned)
+        self.assertIn("token=[REDACTED]", cleaned)
+        self.assertIn("password=[REDACTED]", cleaned)
+        self.assertIn("api_key: [REDACTED]", cleaned)
+        self.assertIn('{token: [REDACTED], next: "ok"}', cleaned)
+
+    def test_redaction_strips_escaped_quotes_and_multiline_quoted_values(self) -> None:
+        raw = (
+            'token="a\\"b_secret" '
+            "password='c\\'d_secret' "
+            'token="line1\nline2_secret" '
+            "secret='m1\nm2_secret' "
+            'inline Cookie: sid="x\\"y\nz_secret"; uid=789_secret tail'
+        )
+        cleaned = redact_sensitive_text(raw)
+        for secret in ("a\\\"b_secret", "b_secret", "c\\'d_secret", "d_secret", "line1", "line2_secret", "m1", "m2_secret", "z_secret", "789_secret"):
+            self.assertNotIn(secret, cleaned)
+        self.assertEqual(cleaned.count("token=[REDACTED]"), 2)
+        self.assertIn("password=[REDACTED]", cleaned)
+        self.assertIn("secret=[REDACTED]", cleaned)
+        self.assertIn("Cookie: [REDACTED] tail", cleaned)
+
     def test_client_auth_headers_and_browse_fallback(self) -> None:
         calls: List[Tuple[str, str, Dict[str, str]]] = []
 

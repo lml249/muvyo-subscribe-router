@@ -125,14 +125,16 @@ def evaluate_subscription_completion(
     skip_best_version: bool = True,
     skip_version_rules: bool = True,
     allow_completed_past_season: bool = True,
+    allow_completed_latest_season: bool = True,
+    latest_season_quiet_days: int = 30,
     tmdb_fallback_fetcher: Optional[Callable[[int, str], Any]] = None,
     today: Optional[date] = None,
 ) -> CompletionDecision:
     """
     Conservatively determine whether a newly added MoviePilot subscription should be
     routed to Muvyo/MV3 first. Ongoing current/future seasons and uncertain TV series
-    are passed through to PT; strictly past completed seasons of returning series may
-    be routed when allow_completed_past_season is True.
+    are passed through to PT; strictly past completed seasons or quietly finished
+    latest seasons of returning series may be routed when enabled.
     """
     ref_today = today or date.today()
     media_kind = _normalize_media_kind(_get(subscribe, "type") or _get(mediainfo, "type"))
@@ -288,22 +290,69 @@ def evaluate_subscription_completion(
 
     if status_lower in ONGOING_STATUSES:
         number_of_seasons = _positive_int(_get(mediainfo, "number_of_seasons"))
+        target_season_air_date = (
+            _parse_date(_get(season_entry, "air_date")) if season_entry else None
+        )
         next_season_entry = _find_season_entry(mediainfo, target_season + 1)
-        next_season_air_date = _parse_date(_get(next_season_entry, "air_date")) if next_season_entry else None
-        # Only consider a past season finished if a strictly later season already started airing
-        # and next_episode_to_air is not in target_season.
+        next_season_air_date = (
+            _parse_date(_get(next_season_entry, "air_date")) if next_season_entry else None
+        )
+        target_season_started = (
+            target_season_air_date is None or target_season_air_date <= ref_today
+        )
+        next_season_started = (
+            next_season_air_date is not None
+            and next_season_air_date <= ref_today
+            and (not next_ep or next_ep_season > target_season)
+        )
+        next_ep_in_later_season = bool(next_ep) and next_ep_season > target_season
+        # 1) Past season is completed when target season has aired and either a later season
+        # already started airing or next_episode_to_air points to a strictly later season.
         if (
             allow_completed_past_season
             and target_season > 0
             and number_of_seasons > target_season
             and expected_episodes > 0
-            and next_season_air_date is not None
-            and next_season_air_date <= ref_today
-            and (not next_ep or next_ep_season > target_season)
+            and target_season_started
+            and (next_season_started or next_ep_in_later_season)
         ):
             return CompletionDecision(
                 eligible=True,
                 reason="tv_previous_season_completed",
+                media_kind="tv",
+                season=target_season,
+                expected_episodes=expected_episodes,
+                tmdb_status=status,
+                title=title,
+                original_title=original_title,
+                year=year,
+            )
+
+        # 2) Latest season quiet completion: returning series with no next_episode_to_air
+        # and last_air_date sufficiently in the past within the aired target season.
+        try:
+            quiet_days = max(
+                7,
+                int(30 if latest_season_quiet_days in (None, "") else latest_season_quiet_days),
+            )
+        except (TypeError, ValueError, OverflowError):
+            quiet_days = 30
+        quiet_threshold = quiet_days
+        if (
+            allow_completed_latest_season
+            and target_season > 0
+            and expected_episodes > 0
+            and (number_of_seasons == 0 or target_season == number_of_seasons)
+            and not next_ep
+            and last_air_date is not None
+            and (ref_today - last_air_date).days >= quiet_threshold
+            and target_season_air_date is not None
+            and target_season_air_date <= last_air_date
+            and target_season_air_date <= ref_today
+        ):
+            return CompletionDecision(
+                eligible=True,
+                reason="tv_latest_season_quiet_completed",
                 media_kind="tv",
                 season=target_season,
                 expected_episodes=expected_episodes,

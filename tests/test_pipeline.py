@@ -13,6 +13,7 @@ if str(PLUGINS_ROOT) not in sys.path:
 from muvyosubscriberouter.client import MuvyoClient
 from muvyosubscriberouter.completion import CompletionDecision
 from muvyosubscriberouter.pipeline import (
+    PipelineResult,
     RouterPipelineConfig,
     run_muvyo_routing_pipeline,
     validate_router_paths,
@@ -23,12 +24,14 @@ class _FakePipelineClient:
     def __init__(
         self,
         *,
+        api_key: str = "",
         has_results: bool = True,
         staged_items: List[Dict[str, Any]] | None = None,
         organize_ok: bool = True,
         organize_blockers: List[str] | None = None,
         resolved_target_dirs: List[str] | None = None,
     ) -> None:
+        self.api_key = api_key
         self.has_results = has_results
         self.organize_ok = organize_ok
         self.organize_blockers = list(organize_blockers or [])
@@ -42,6 +45,8 @@ class _FakePipelineClient:
             {"fn": "Demo.S01E02.mkv", "fid": "v2", "pickcode": "pc_secret_2"},
         ]
         self.calls: List[str] = []
+        self.ensured_paths: List[str] = []
+        self.received_paths: List[str] = []
         self.organize_kwargs: Dict[str, Any] = {}
         self.strm_kwargs: Dict[str, Any] = {}
 
@@ -68,10 +73,12 @@ class _FakePipelineClient:
 
     def ensure_115_folder(self, target_path: str) -> Dict[str, Any]:
         self.calls.append("ensure_folder")
+        self.ensured_paths.append(target_path)
         return {"ok": True, "target_path": target_path, "final_folder_id": "staging_fid_9"}
 
     def receive_share(self, share_code: str, file_ids, target_path: str, receive_code: str = "") -> Dict[str, Any]:
         self.calls.append("receive")
+        self.received_paths.append(target_path)
         return {"ok": True, "file_id_count": len(file_ids), "target_path": target_path}
 
     def browse_cloud_folder(self, folder_id: str = "", path: str = "", limit: int = 1150) -> Dict[str, Any]:
@@ -270,6 +277,113 @@ class TestPipeline(unittest.TestCase):
         self.assertEqual(res.reason, "plugin_stopped_during_ensure_staging")
         self.assertFalse(any(method == "POST" and "/api/v1/files/115/folder" in url for method, url in requests))
         self.assertFalse(any("/api/v1/share-transfer/receive" in url for _, url in requests))
+
+    def test_staging_path_redacts_sensitive_title_segments(self) -> None:
+        client = _FakePipelineClient()
+        decision = CompletionDecision(
+            eligible=True,
+            reason="tv_series_ended",
+            media_kind="tv",
+            season=1,
+            expected_episodes=2,
+            title='Cookie: sid="RAW_COOKIE_VAL"; uid=RAW_UID_VAL Bearer RAW_BEARER_VAL share.example.local/s/RAW_SHARE_CODE',
+            original_title="演示剧集",
+        )
+
+        def _probe(tool: str, url: str, timeout: int):
+            return {
+                "ok": True,
+                "audio_streams": [{"language": "eng", "title": "English"}],
+                "subtitle_streams": [{"language": "zh-cn", "title": "简体中文"}],
+            }
+
+        res = run_muvyo_routing_pipeline(
+            client,  # type: ignore[arg-type]
+            decision,
+            tmdb_id=3007,
+            config=RouterPipelineConfig(),
+            run_id="r7",
+            probe_runner=_probe,
+        )
+        self.assertEqual(res.status, "routed_ok")
+        self.assertIn("ensure_folder", client.calls)
+        self.assertEqual(len(client.ensured_paths), 1)
+
+        sanitized = res.to_sanitized_dict()
+        candidates = [
+            res.staging_path,
+            sanitized["staging_path"],
+            client.ensured_paths[0],
+        ]
+        for path in candidates:
+            self.assertTrue(path.startswith("/未整理/mp-router/"), path)
+            self.assertNotIn("REDACTED", path)
+            for secret in (
+                "RAW_COOKIE_VAL",
+                "RAW_UID_VAL",
+                "RAW_BEARER_VAL",
+                "RAW_SHARE_CODE",
+            ):
+                self.assertNotIn(secret, path)
+
+    def test_staging_path_and_result_redact_quoted_tokens_and_client_api_key(self) -> None:
+        client = _FakePipelineClient(api_key="RAW_MV_API_KEY_999")
+        decision = CompletionDecision(
+            eligible=True,
+            reason="tv_series_ended",
+            media_kind="tv",
+            season=1,
+            expected_episodes=2,
+            title='演示剧集 token="RAW_QUOTED_TOK" RAW_MV_API_KEY_999',
+            original_title="演示剧集",
+        )
+
+        def _probe(tool: str, url: str, timeout: int):
+            return {
+                "ok": True,
+                "audio_streams": [{"language": "eng", "title": "English"}],
+                "subtitle_streams": [{"language": "zh-cn", "title": "简体中文"}],
+            }
+
+        res = run_muvyo_routing_pipeline(
+            client,  # type: ignore[arg-type]
+            decision,
+            tmdb_id=3008,
+            config=RouterPipelineConfig(),
+            run_id="r8",
+            probe_runner=_probe,
+        )
+        self.assertEqual(res.status, "routed_ok")
+        self.assertEqual(len(client.ensured_paths), 1)
+        self.assertEqual(len(client.received_paths), 1)
+
+        sanitized = res.to_sanitized_dict()
+        sanitized_json = json.dumps(sanitized, ensure_ascii=False)
+        for target in (
+            client.ensured_paths[0],
+            client.received_paths[0],
+            res.staging_path,
+            sanitized["staging_path"],
+            sanitized_json,
+        ):
+            self.assertNotIn("RAW_QUOTED_TOK", target)
+            self.assertNotIn("RAW_MV_API_KEY_999", target)
+
+        for path in (
+            client.ensured_paths[0],
+            client.received_paths[0],
+            res.staging_path,
+            sanitized["staging_path"],
+        ):
+            self.assertTrue(path.startswith("/未整理/mp-router/"), path)
+            self.assertNotIn("REDACTED", path)
+
+        explicit_res = PipelineResult(
+            status="fallback_pt",
+            reason="err RAW_MV_API_KEY_999",
+            staging_path="/未整理/mp-router/RAW_MV_API_KEY_999",
+        ).to_sanitized_dict(extra_secrets=["RAW_MV_API_KEY_999"])
+        self.assertNotIn("RAW_MV_API_KEY_999", json.dumps(explicit_res, ensure_ascii=False))
 
 
 if __name__ == "__main__":

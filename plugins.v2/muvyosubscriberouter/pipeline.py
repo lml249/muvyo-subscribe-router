@@ -5,11 +5,11 @@ import re
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from .client import MuvyoClient, MuvyoClientError
 from .completion import CompletionDecision
-from .redaction import redact_exception, redact_sensitive_text, short_hash
+from .redaction import redact_exception, redact_sensitive_data, redact_sensitive_text, short_hash
 from .selector import (
     classify_media_kind,
     extract_season_and_episode,
@@ -150,11 +150,11 @@ class PipelineResult:
     subtitle_audit: Dict[str, Any] = field(default_factory=dict)
     diagnostics: Dict[str, Any] = field(default_factory=dict)
 
-    def to_sanitized_dict(self) -> Dict[str, Any]:
+    def to_sanitized_dict(self, extra_secrets: Optional[Sequence[str]] = None) -> Dict[str, Any]:
         return {
             "status": self.status,
-            "reason": redact_sensitive_text(self.reason, max_length=300),
-            "staging_path": self.staging_path,
+            "reason": redact_sensitive_text(self.reason, max_length=300, extra_secrets=extra_secrets),
+            "staging_path": redact_sensitive_text(self.staging_path, max_length=300, extra_secrets=extra_secrets),
             "video_count": self.video_count,
             "episodes": list(self.episodes),
             "subtitle_audit": {
@@ -163,9 +163,12 @@ class PipelineResult:
                 "passed_count": self.subtitle_audit.get("passed_count", 0),
                 "failed_count": self.subtitle_audit.get("failed_count", 0),
                 "exempt_chinese_audio_count": self.subtitle_audit.get("exempt_chinese_audio_count", 0),
-                "blockers": list(self.subtitle_audit.get("blockers", [])),
+                "blockers": redact_sensitive_data(
+                    list(self.subtitle_audit.get("blockers", [])),
+                    extra_secrets=extra_secrets,
+                ),
             } if self.subtitle_audit else {},
-            "diagnostics": self.diagnostics,
+            "diagnostics": redact_sensitive_data(self.diagnostics, extra_secrets=extra_secrets),
         }
 
 
@@ -204,6 +207,8 @@ def run_muvyo_routing_pipeline(
     if not tmdb_id or int(tmdb_id) <= 0:
         return PipelineResult(status="fallback_pt", reason="tmdb_id_missing")
 
+    extra_secrets = [getattr(client, "api_key", "")]
+
     # Step A & B: Resource search + share parse/browse/select
     try:
         plan, search_diag = select_best_share_candidate(
@@ -221,7 +226,7 @@ def run_muvyo_routing_pipeline(
     except MuvyoClientError as exc:
         return PipelineResult(
             status="fallback_pt",
-            reason=f"mv3_search_error:{redact_exception(exc)}",
+            reason=f"mv3_search_error:{redact_exception(exc, extra_secrets=extra_secrets)}",
             diagnostics={"stage": "search"},
         )
 
@@ -242,7 +247,9 @@ def run_muvyo_routing_pipeline(
                 "stage": "dry_run",
                 "title_hash": plan.title_hash,
                 "score": plan.score,
-                "matched_keyword": plan.matched_keyword,
+                "matched_keyword": redact_sensitive_text(
+                    plan.matched_keyword, max_length=200, extra_secrets=extra_secrets
+                ),
                 "excluded_metadata_count": plan.excluded_metadata_count,
             },
         )
@@ -252,7 +259,9 @@ def run_muvyo_routing_pipeline(
 
     # Step D: Ensure isolated staging directory & receive share
     rid = run_id or short_hash(f"{tmdb_id}:{decision.season}:{time.time()}")
-    title_seg = _safe_folder_segment(decision.title)
+    title_seg = _safe_folder_segment(
+        redact_sensitive_text(decision.title, max_length=200, extra_secrets=extra_secrets).replace("[REDACTED]", " ")
+    )
     season_seg = f"s{decision.season:02d}" if decision.media_kind == "tv" else "movie"
     staging_base = normalize_cloud_path(config.staging_root)
     staging_path = f"{staging_base}/{title_seg}_tmdb{int(tmdb_id)}_{season_seg}_{rid}"
@@ -271,7 +280,7 @@ def run_muvyo_routing_pipeline(
     except MuvyoClientError as exc:
         return PipelineResult(
             status="fallback_pt",
-            reason=f"ensure_staging_failed:{redact_exception(exc)}",
+            reason=f"ensure_staging_failed:{redact_exception(exc, extra_secrets=extra_secrets)}",
             staging_path=staging_path,
         )
 
@@ -307,7 +316,7 @@ def run_muvyo_routing_pipeline(
     except MuvyoClientError as exc:
         return PipelineResult(
             status="fallback_pt",
-            reason=f"share_receive_failed:{redact_exception(exc)}",
+            reason=f"share_receive_failed:{redact_exception(exc, extra_secrets=extra_secrets)}",
             staging_path=staging_path,
         )
 
@@ -324,7 +333,7 @@ def run_muvyo_routing_pipeline(
     except MuvyoClientError as exc:
         return PipelineResult(
             status="manual_review_staging",
-            reason=f"staging_browse_failed:{redact_exception(exc)}",
+            reason=f"staging_browse_failed:{redact_exception(exc, extra_secrets=extra_secrets)}",
             staging_path=staging_path,
         )
 
@@ -390,13 +399,19 @@ def run_muvyo_routing_pipeline(
     )
     if not sub_audit.get("ok"):
         # CRITICAL: stop in staging for manual review; NEVER organize, NEVER generate STRM, NEVER delete staging!
+        safe_blockers = [
+            redact_sensitive_text(str(b), max_length=200, extra_secrets=extra_secrets)
+            for b in sub_audit.get("blockers", [])
+        ]
+        safe_sub_audit = dict(sub_audit)
+        safe_sub_audit["blockers"] = safe_blockers
         return PipelineResult(
             status="manual_review_staging",
-            reason="subtitle_gate_blocked:" + ",".join(sub_audit.get("blockers", [])),
+            reason="subtitle_gate_blocked:" + ",".join(safe_blockers),
             staging_path=staging_path,
             video_count=len(staged_videos),
             episodes=sorted(set(staged_episodes)),
-            subtitle_audit=sub_audit,
+            subtitle_audit=safe_sub_audit,
             diagnostics={"stage": "subtitle_gate"},
         )
 
@@ -429,7 +444,7 @@ def run_muvyo_routing_pipeline(
     except MuvyoClientError as exc:
         return PipelineResult(
             status="manual_review_staging",
-            reason=f"organize_transfer_failed:{redact_exception(exc)}",
+            reason=f"organize_transfer_failed:{redact_exception(exc, extra_secrets=extra_secrets)}",
             staging_path=staging_path,
             video_count=len(staged_videos),
             episodes=sorted(set(staged_episodes)),
@@ -437,7 +452,11 @@ def run_muvyo_routing_pipeline(
         )
 
     if not org_res.get("ok"):
-        org_blockers = [str(b) for b in (org_res.get("blockers") or []) if b]
+        org_blockers = [
+            redact_sensitive_text(str(b), max_length=200, extra_secrets=extra_secrets)
+            for b in (org_res.get("blockers") or [])
+            if b
+        ]
         reason = "organize_transfer_blocked:" + ",".join(org_blockers) if org_blockers else "organize_transfer_not_ok"
         return PipelineResult(
             status="manual_review_staging",
@@ -501,7 +520,7 @@ def run_muvyo_routing_pipeline(
                 except MuvyoClientError as exc:
                     return PipelineResult(
                         status="manual_review_staging",
-                        reason=f"strm_generate_failed:{redact_exception(exc)}",
+                        reason=f"strm_generate_failed:{redact_exception(exc, extra_secrets=extra_secrets)}",
                         staging_path=staging_path,
                         video_count=len(staged_videos),
                         episodes=sorted(set(staged_episodes)),

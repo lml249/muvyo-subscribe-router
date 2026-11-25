@@ -107,8 +107,9 @@ class TestPluginLifecycle(unittest.TestCase):
         package_path = Path(__file__).resolve().parents[1] / "package.v2.json"
         manifest = json.loads(package_path.read_text(encoding="utf-8"))
         entry = manifest["MuvyoSubscribeRouter"]
-        self.assertEqual(MuvyoSubscribeRouter.plugin_version, "0.1")
+        self.assertEqual(MuvyoSubscribeRouter.plugin_version, "0.2")
         self.assertEqual(entry["version"], MuvyoSubscribeRouter.plugin_version)
+        self.assertIn("v0.2", entry["history"])
         self.assertIn("v0.1", entry["history"])
 
     def test_subscribe_added_pauses_then_completes_on_routed_ok(self) -> None:
@@ -733,6 +734,392 @@ class TestPluginLifecycle(unittest.TestCase):
         mock_send_notice.assert_not_called()
         self.assertEqual(fake_oper.subs[208]["state"], "S")
         self.assertEqual(plugin._inflight_sids, set())
+
+    def test_passthrough_records_redacted_history_without_updating_subscribe_or_notifying(self) -> None:
+        plugin = self._make_plugin(
+            allow_completed_latest_season=True,
+            latest_season_quiet_days=500,
+            notify=True,
+        )
+        self.addCleanup(plugin.stop_service)
+        self.assertEqual(plugin._latest_season_quiet_days, 365)
+
+        _, defaults = plugin.get_form()
+        self.assertTrue(defaults["allow_completed_latest_season"])
+        self.assertEqual(defaults["latest_season_quiet_days"], 30)
+
+        fake_oper = _FakeSubscribeOper({
+            301: {
+                "id": 301,
+                "name": "连载示例剧 token=secret_inline_tok",
+                "type": "电视剧",
+                "season": 2,
+                "tmdbid": 7001,
+                "state": "N",
+            }
+        })
+        media = {
+            "status": "Returning Series",
+            "number_of_seasons": 2,
+            "next_episode_to_air": {"season_number": 2, "episode_number": 5},
+            "season_info": [{"season_number": 2, "episode_count": 10, "air_date": "2024-10-01"}],
+        }
+
+        with patch.object(plugin_mod, "SubscribeOper", return_value=fake_oper), \
+             patch.object(plugin, "post_message") as mock_post, \
+             patch.object(plugin_mod.logger, "info") as mock_info:
+            plugin.on_subscribe_added(Event(EventType.SubscribeAdded, {"subscribe_id": 301, "mediainfo": media}))
+
+        self.assertEqual(fake_oper.updates, [])
+        self.assertEqual(fake_oper.deleted, [])
+        self.assertEqual(fake_oper.histories, [])
+        self.assertEqual(fake_oper.subs[301]["state"], "N")
+        mock_post.assert_not_called()
+
+        history = plugin.get_data("history") or []
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0]["status"], "passthrough_pt")
+        self.assertEqual(history[0]["reason"], "next_episode_to_air_in_target_season")
+        self.assertEqual(history[0]["subscribe_id"], 301)
+        self.assertEqual(history[0]["tmdb_id"], 7001)
+        self.assertNotIn("secret_inline_tok", history[0]["title"])
+        self.assertNotIn("demo_key_secret", str(history[0]))
+
+        mock_info.assert_called_once()
+        logged_msg = mock_info.call_args[0][0]
+        self.assertIn("passthrough subscribe #301", logged_msg)
+        self.assertIn("next_episode_to_air_in_target_season", logged_msg)
+        self.assertNotIn("secret_inline_tok", logged_msg)
+        self.assertNotIn("demo_key_secret", logged_msg)
+
+        page_text = str(plugin.get_page())
+        self.assertIn("直接放行 PT：1", page_text)
+        self.assertIn("passthrough_pt", page_text)
+
+    def test_title_inline_bearer_cookie_and_share_link_redacted_in_passthrough_and_routing_logs(self) -> None:
+        plugin = self._make_plugin(notify=True)
+        self.addCleanup(plugin.stop_service)
+        plugin._executor = _SyncExecutor()  # type: ignore[assignment]
+
+        leaky_title = (
+            "绝密剧集 Bearer inline_bearer_secret "
+            "Authorization: Bearer hdr_bearer_secret "
+            "cookie=UID=u_secret1; CID=c_secret2; SEID=s_secret3 "
+            "https://115.com/s/sw3sharesecret?password=pwd_secret"
+        )
+        forbidden_tokens = (
+            "inline_bearer_secret",
+            "hdr_bearer_secret",
+            "u_secret1",
+            "c_secret2",
+            "s_secret3",
+            "sw3sharesecret",
+            "pwd_secret",
+            "demo_key_secret",
+        )
+
+        # 1) Passthrough path: log + history
+        fake_oper_pass = _FakeSubscribeOper({
+            302: {
+                "id": 302,
+                "name": leaky_title,
+                "type": "电视剧",
+                "season": 2,
+                "tmdbid": 7002,
+                "state": "N",
+            }
+        })
+        media_ongoing = {
+            "status": "Returning Series",
+            "number_of_seasons": 2,
+            "next_episode_to_air": {"season_number": 2, "episode_number": 5},
+            "season_info": [{"season_number": 2, "episode_count": 10, "air_date": "2024-10-01"}],
+        }
+        with patch.object(plugin_mod, "SubscribeOper", return_value=fake_oper_pass), \
+             patch.object(plugin_mod.logger, "info") as mock_pass_info:
+            plugin.on_subscribe_added(Event(EventType.SubscribeAdded, {"subscribe_id": 302, "mediainfo": media_ongoing}))
+
+        mock_pass_info.assert_called_once()
+        pass_log = mock_pass_info.call_args[0][0]
+        pass_history = [h for h in (plugin.get_data("history") or []) if h.get("subscribe_id") == 302]
+        self.assertEqual(len(pass_history), 1)
+        self.assertEqual(pass_history[0]["status"], "passthrough_pt")
+        for secret in forbidden_tokens:
+            self.assertNotIn(secret, pass_log)
+            self.assertNotIn(secret, pass_history[0]["title"])
+        self.assertIn("Bearer [REDACTED]", pass_log)
+        self.assertIn("Authorization: [REDACTED]", pass_log)
+        self.assertIn("cookie=[REDACTED]", pass_log)
+        self.assertIn("https://115.com/s/[REDACTED]", pass_log)
+
+        # 2) Routing path: routing log + history + notice
+        fake_oper_route = _FakeSubscribeOper({
+            303: {
+                "id": 303,
+                "name": leaky_title,
+                "type": "电视剧",
+                "season": 1,
+                "tmdbid": 7003,
+                "state": "N",
+            }
+        })
+        media_ended = {
+            "status": "Ended",
+            "last_air_date": "2024-01-01",
+            "season_info": [{"season_number": 1, "episode_count": 4}],
+        }
+        ok_result = PipelineResult(status="routed_ok", reason="muvyo_routed_and_organized", video_count=4, episodes=[1, 2, 3, 4])
+        with patch.object(plugin_mod, "SubscribeOper", return_value=fake_oper_route), \
+             patch.object(plugin_mod, "run_muvyo_routing_pipeline", return_value=ok_result), \
+             patch.object(plugin, "post_message") as mock_post, \
+             patch.object(plugin_mod.logger, "info") as mock_route_info:
+            plugin.on_subscribe_added(Event(EventType.SubscribeAdded, {"subscribe_id": 303, "mediainfo": media_ended}))
+
+        route_logs = [c[0][0] for c in mock_route_info.call_args_list if "routing subscribe #303" in c[0][0]]
+        self.assertEqual(len(route_logs), 1)
+        route_log = route_logs[0]
+        route_history = [h for h in (plugin.get_data("history") or []) if h.get("subscribe_id") == 303]
+        self.assertEqual(len(route_history), 1)
+        mock_post.assert_called_once()
+        notice_title = mock_post.call_args.kwargs.get("title", "")
+        for secret in forbidden_tokens:
+            self.assertNotIn(secret, route_log)
+            self.assertNotIn(secret, route_history[0]["title"])
+            self.assertNotIn(secret, notice_title)
+        self.assertIn("https://115.com/s/[REDACTED]", route_log)
+
+    def test_string_false_and_none_quiet_days_do_not_error_or_misenable(self) -> None:
+        for false_val in ("false", "False", "0", "no", "off", ""):
+            plugin = self._make_plugin(
+                allow_completed_latest_season=false_val,
+                latest_season_quiet_days=None,
+            )
+            self.addCleanup(plugin.stop_service)
+            self.assertFalse(plugin._allow_completed_latest_season)
+            self.assertEqual(plugin._latest_season_quiet_days, 30)
+
+        plugin = self._make_plugin(
+            allow_completed_latest_season="false",
+            latest_season_quiet_days=None,
+        )
+        self.addCleanup(plugin.stop_service)
+        plugin._executor = _SyncExecutor()  # type: ignore[assignment]
+        fake_oper = _FakeSubscribeOper({
+            304: {"id": 304, "name": "连载静默测试剧", "type": "电视剧", "season": 4, "tmdbid": 7004, "state": "N"}
+        })
+        media = {
+            "status": "Returning Series",
+            "number_of_seasons": 4,
+            "last_air_date": "2020-01-01",
+            "next_episode_to_air": None,
+            "season_info": [{"season_number": 4, "episode_count": 8, "air_date": "2019-10-01"}],
+        }
+        with patch.object(plugin_mod, "SubscribeOper", return_value=fake_oper), \
+             patch.object(plugin_mod, "run_muvyo_routing_pipeline") as mock_pipe:
+            plugin.on_subscribe_added(Event(EventType.SubscribeAdded, {"subscribe_id": 304, "mediainfo": media}))
+
+        mock_pipe.assert_not_called()
+        history = plugin.get_data("history") or []
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0]["status"], "passthrough_pt")
+        self.assertEqual(history[0]["reason"], "tv_ongoing_status:returning series")
+
+        for inf_days in (float("inf"), float("-inf")):
+            inf_plugin = self._make_plugin(latest_season_quiet_days=inf_days)
+            self.addCleanup(inf_plugin.stop_service)
+            self.assertEqual(inf_plugin._latest_season_quiet_days, 30)
+
+    def test_title_ending_with_bearer_preserves_season_in_logs(self) -> None:
+        plugin = self._make_plugin(notify=False)
+        self.addCleanup(plugin.stop_service)
+        plugin._executor = _SyncExecutor()  # type: ignore[assignment]
+
+        # 1) Passthrough log keeps S01 intact
+        fake_oper_pass = _FakeSubscribeOper({
+            305: {"id": 305, "name": "The Bearer", "type": "电视剧", "season": 1, "tmdbid": 7005, "state": "N"}
+        })
+        media_ongoing = {
+            "status": "Returning Series",
+            "number_of_seasons": 1,
+            "next_episode_to_air": {"season_number": 1, "episode_number": 4},
+            "season_info": [{"season_number": 1, "episode_count": 8, "air_date": "2024-10-01"}],
+        }
+        with patch.object(plugin_mod, "SubscribeOper", return_value=fake_oper_pass), \
+             patch.object(plugin_mod.logger, "info") as mock_pass_info:
+            plugin.on_subscribe_added(Event(EventType.SubscribeAdded, {"subscribe_id": 305, "mediainfo": media_ongoing}))
+
+        mock_pass_info.assert_called_once()
+        pass_log = mock_pass_info.call_args[0][0]
+        self.assertIn("(The Bearer S01)", pass_log)
+        self.assertNotIn("Bearer [REDACTED]", pass_log)
+
+        # 2) Routing log keeps S01 intact
+        fake_oper_route = _FakeSubscribeOper({
+            306: {"id": 306, "name": "The Bearer", "type": "电视剧", "season": 1, "tmdbid": 7006, "state": "N"}
+        })
+        media_ended = {
+            "status": "Ended",
+            "last_air_date": "2024-01-01",
+            "season_info": [{"season_number": 1, "episode_count": 4}],
+        }
+        ok_result = PipelineResult(status="routed_ok", reason="muvyo_routed_and_organized", video_count=4, episodes=[1, 2, 3, 4])
+        with patch.object(plugin_mod, "SubscribeOper", return_value=fake_oper_route), \
+             patch.object(plugin_mod, "run_muvyo_routing_pipeline", return_value=ok_result), \
+             patch.object(plugin_mod.logger, "info") as mock_route_info:
+            plugin.on_subscribe_added(Event(EventType.SubscribeAdded, {"subscribe_id": 306, "mediainfo": media_ended}))
+
+        route_logs = [c[0][0] for c in mock_route_info.call_args_list if "routing subscribe #306" in c[0][0]]
+        self.assertEqual(len(route_logs), 1)
+        self.assertIn("(The Bearer S01)", route_logs[0])
+        self.assertNotIn("Bearer [REDACTED]", route_logs[0])
+
+    def test_title_quoted_cookie_and_bare_share_link_redacted_in_passthrough_and_routing(self) -> None:
+        plugin = self._make_plugin(notify=True)
+        self.addCleanup(plugin.stop_service)
+        plugin._executor = _SyncExecutor()  # type: ignore[assignment]
+
+        leaky_title = (
+            '测试剧 Cookie: sid="abc;123"; uid=456 '
+            "share.example.local/s/demo_bare_123?password=bare_pwd "
+            "115.com/s/sw3bare999"
+        )
+        forbidden_tokens = ("abc;123", "uid=456", "demo_bare_123", "bare_pwd", "sw3bare999")
+
+        # 1) Passthrough path
+        fake_oper_pass = _FakeSubscribeOper({
+            307: {"id": 307, "name": leaky_title, "type": "电视剧", "season": 2, "tmdbid": 7007, "state": "N"}
+        })
+        media_ongoing = {
+            "status": "Returning Series",
+            "number_of_seasons": 2,
+            "next_episode_to_air": {"season_number": 2, "episode_number": 5},
+            "season_info": [{"season_number": 2, "episode_count": 10, "air_date": "2024-10-01"}],
+        }
+        with patch.object(plugin_mod, "SubscribeOper", return_value=fake_oper_pass), \
+             patch.object(plugin_mod.logger, "info") as mock_pass_info:
+            plugin.on_subscribe_added(Event(EventType.SubscribeAdded, {"subscribe_id": 307, "mediainfo": media_ongoing}))
+
+        mock_pass_info.assert_called_once()
+        pass_log = mock_pass_info.call_args[0][0]
+        pass_history = [h for h in (plugin.get_data("history") or []) if h.get("subscribe_id") == 307]
+        self.assertEqual(len(pass_history), 1)
+        for secret in forbidden_tokens:
+            self.assertNotIn(secret, pass_log)
+            self.assertNotIn(secret, pass_history[0]["title"])
+        self.assertIn("Cookie: [REDACTED]", pass_log)
+        self.assertIn("share.example.local/s/[REDACTED]", pass_log)
+        self.assertIn("115.com/s/[REDACTED]", pass_log)
+
+        # 2) Routing path
+        fake_oper_route = _FakeSubscribeOper({
+            308: {"id": 308, "name": leaky_title, "type": "电视剧", "season": 1, "tmdbid": 7008, "state": "N"}
+        })
+        media_ended = {
+            "status": "Ended",
+            "last_air_date": "2024-01-01",
+            "season_info": [{"season_number": 1, "episode_count": 4}],
+        }
+        ok_result = PipelineResult(status="routed_ok", reason="muvyo_routed_and_organized", video_count=4, episodes=[1, 2, 3, 4])
+        with patch.object(plugin_mod, "SubscribeOper", return_value=fake_oper_route), \
+             patch.object(plugin_mod, "run_muvyo_routing_pipeline", return_value=ok_result), \
+             patch.object(plugin, "post_message") as mock_post, \
+             patch.object(plugin_mod.logger, "info") as mock_route_info:
+            plugin.on_subscribe_added(Event(EventType.SubscribeAdded, {"subscribe_id": 308, "mediainfo": media_ended}))
+
+        route_logs = [c[0][0] for c in mock_route_info.call_args_list if "routing subscribe #308" in c[0][0]]
+        self.assertEqual(len(route_logs), 1)
+        route_log = route_logs[0]
+        route_history = [h for h in (plugin.get_data("history") or []) if h.get("subscribe_id") == 308]
+        self.assertEqual(len(route_history), 1)
+        mock_post.assert_called_once()
+        notice_title = mock_post.call_args.kwargs.get("title", "")
+        for secret in forbidden_tokens:
+            self.assertNotIn(secret, route_log)
+            self.assertNotIn(secret, route_history[0]["title"])
+            self.assertNotIn(secret, notice_title)
+        self.assertIn("Cookie: [REDACTED]", route_log)
+        self.assertIn("share.example.local/s/[REDACTED]", route_log)
+        self.assertIn("115.com/s/[REDACTED]", route_log)
+
+    def test_complete_subscribe_redacts_history_fields_and_preserves_normal_titles(self) -> None:
+        plugin = self._make_plugin(on_success_action="complete", notify=False)
+        self.addCleanup(plugin.stop_service)
+        plugin._executor = _SyncExecutor()  # type: ignore[assignment]
+
+        leaky_title = (
+            '示例剧 Cookie: sid="abc;123"; uid=456 '
+            "Bearer inline_bearer_tok "
+            'token="quoted_tok_secret" '
+            "share.example.local/s/bare_share_999?password=bare_pwd "
+            "demo_key_secret"
+        )
+        leaky_desc = '简介 token="desc_line1\ndesc_line2_secret" demo_key_secret'
+        forbidden_tokens = (
+            "abc;123",
+            "uid=456",
+            "inline_bearer_tok",
+            "quoted_tok_secret",
+            "bare_share_999",
+            "bare_pwd",
+            "demo_key_secret",
+            "desc_line1",
+            "desc_line2_secret",
+        )
+        media_ended = {
+            "status": "Ended",
+            "last_air_date": "2024-01-01",
+            "season_info": [{"season_number": 1, "episode_count": 4}],
+        }
+        ok_result = PipelineResult(status="routed_ok", reason="muvyo_routed_and_organized", video_count=4, episodes=[1, 2, 3, 4])
+
+        # 1) Leaky name & description are redacted before SubscribeOper.add_history
+        fake_oper_leaky = _FakeSubscribeOper({
+            309: {
+                "id": 309,
+                "name": leaky_title,
+                "description": leaky_desc,
+                "type": "电视剧",
+                "season": 1,
+                "tmdbid": 7009,
+                "state": "N",
+            }
+        })
+        with patch.object(plugin_mod, "SubscribeOper", return_value=fake_oper_leaky), \
+             patch.object(plugin_mod, "run_muvyo_routing_pipeline", return_value=ok_result):
+            plugin.on_subscribe_added(Event(EventType.SubscribeAdded, {"subscribe_id": 309, "mediainfo": media_ended}))
+
+        self.assertEqual(len(fake_oper_leaky.histories), 1)
+        hist_name = fake_oper_leaky.histories[0]["name"]
+        hist_desc = fake_oper_leaky.histories[0]["description"]
+        for secret in forbidden_tokens:
+            self.assertNotIn(secret, hist_name)
+            self.assertNotIn(secret, hist_desc)
+        self.assertIn("Cookie: [REDACTED]", hist_name)
+        self.assertIn("Bearer [REDACTED]", hist_name)
+        self.assertIn("token=[REDACTED]", hist_name)
+        self.assertIn("share.example.local/s/[REDACTED]", hist_name)
+        self.assertIn("token=[REDACTED]", hist_desc)
+
+        # 2) Normal Chinese/English titles pass through SubscribeOper.add_history untouched
+        for idx, normal_title in enumerate(("示例完结剧", "The Bearer"), start=310):
+            fake_oper_normal = _FakeSubscribeOper({
+                idx: {
+                    "id": idx,
+                    "name": normal_title,
+                    "description": "正常简介内容",
+                    "type": "电视剧",
+                    "season": 1,
+                    "tmdbid": 7000 + idx,
+                    "state": "N",
+                }
+            })
+            with patch.object(plugin_mod, "SubscribeOper", return_value=fake_oper_normal), \
+                 patch.object(plugin_mod, "run_muvyo_routing_pipeline", return_value=ok_result):
+                plugin.on_subscribe_added(Event(EventType.SubscribeAdded, {"subscribe_id": idx, "mediainfo": media_ended}))
+
+            self.assertEqual(len(fake_oper_normal.histories), 1)
+            self.assertEqual(fake_oper_normal.histories[0]["name"], normal_title)
+            self.assertEqual(fake_oper_normal.histories[0]["description"], "正常简介内容")
 
 
 if __name__ == "__main__":

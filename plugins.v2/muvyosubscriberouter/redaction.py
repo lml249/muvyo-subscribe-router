@@ -4,6 +4,10 @@ import hashlib
 import re
 from typing import Any, Dict, List, Sequence
 
+REDIRECT_URL_RE = re.compile(r"(?i)https?://[^\s\"'<>]*/redirect\?[^\s\"'<>]+")
+SHARE_PATH_URL_RE = re.compile(
+    r"(?i)((?:https?://[^\s\"'<>]*?|(?:[a-z0-9-]+(?:\.[a-z0-9-]+)+|localhost)(?::\d+)?(?:/[^\s\"'<>]*?)?)/(?:s|share[_-]?code)/)[^\s/?#\"'<>()\[\]]+(?:\?[^\s\"'<>()\[\]]*)?"
+)
 SENSITIVE_QUERY_RE = re.compile(
     r"(?i)([?&](?:token|api[_-]?key|apikey|password|passwd|secret|cookie|"
     r"authorization|access[_-]?key|access[_-]?token|refresh[_-]?token|"
@@ -12,17 +16,30 @@ SENSITIVE_QUERY_RE = re.compile(
 AUTH_HEADER_RE = re.compile(
     r"(?im)^(\s*(?:authorization|cookie|x-api-key|x-emby-token|x-mediabrowser-token)\s*[:=]\s*)[^\r\n]+"
 )
+INLINE_AUTH_RE = re.compile(
+    r"(?i)\b((?:authorization|x-api-key|x-emby-token|x-mediabrowser-token)[ \t]*[:=][ \t]*)(?:bearer[ \t]+)?[^\s,;\"'<>]+"
+)
+BEARER_TOKEN_RE = re.compile(r"(?i)\bbearer[ \t]+[^\s,;\"'<>]+")
+_QUOTED_VALUE = r"(?:\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*')"
+_COOKIE_QUOTED_OR_PLAIN = rf"(?:{_QUOTED_VALUE}|[^;\s\r\n]+)"
+_COOKIE_OPT_VALUE = rf"(?:{_QUOTED_VALUE}|[^;\s\r\n]*)"
+INLINE_COOKIE_RE = re.compile(
+    rf"(?i)\b(cookie[ \t]*[:=][ \t]*)(?:[^\s=;,\"'<>]+={_COOKIE_OPT_VALUE}|{_COOKIE_QUOTED_OR_PLAIN})(?:[ \t]*;[ \t]*(?:[^\s=;,\"'<>]+={_COOKIE_OPT_VALUE}|HttpOnly|Secure))*",
+    re.DOTALL,
+)
 TOKEN_ASSIGNMENT_RE = re.compile(
     r"(?i)\b(token|api[_-]?key|apikey|mv[_-]?api[_-]?key|password|passwd|secret|"
     r"authorization|cookie|access[_-]?key|access[_-]?token|refresh[_-]?token|"
-    r"pick[_-]?code|pickcode|receive[_-]?code|share[_-]?code)\s*[:=]\s*[^,\s\"'<>]+"
+    r"pick[_-]?code|pickcode|receive[_-]?code|share[_-]?code)([ \t]*[:=]\s*)(?!\[REDACTED\])"
+    + rf"(?:{_QUOTED_VALUE}|"
+    + r"[^\s,&;'\"}\]]+)",
+    re.DOTALL,
 )
 QUOTED_SENSITIVE_ASSIGNMENT_RE = re.compile(
     r"""(?i)((["'])(?:token|api[_-]?key|apikey|mv[_-]?api[_-]?key|password|passwd|secret|"""
     r"""authorization|cookie|access[_-]?key|access[_-]?token|refresh[_-]?token|"""
     r"""pick[_-]?code|pickcode|pc|receive[_-]?code|share[_-]?code|pwd)\2\s*:\s*)(["'])(?:\\.|(?!\3).)*\3"""
 )
-REDIRECT_URL_RE = re.compile(r"(?i)https?://[^\s\"'<>]*/redirect\?[^\s\"'<>]+")
 
 SENSITIVE_FIELD_NAMES = {
     "token",
@@ -78,9 +95,13 @@ def redact_sensitive_text(
             if len(s) >= 3 and s in text:
                 text = text.replace(s, "[REDACTED]")
     redacted = REDIRECT_URL_RE.sub("<redacted-redirect-url>", text)
+    redacted = SHARE_PATH_URL_RE.sub(r"\1[REDACTED]", redacted)
     redacted = SENSITIVE_QUERY_RE.sub(r"\1[REDACTED]", redacted)
     redacted = AUTH_HEADER_RE.sub(r"\1[REDACTED]", redacted)
-    redacted = TOKEN_ASSIGNMENT_RE.sub(lambda m: f"{m.group(1)}=[REDACTED]", redacted)
+    redacted = INLINE_AUTH_RE.sub(r"\1[REDACTED]", redacted)
+    redacted = BEARER_TOKEN_RE.sub("Bearer [REDACTED]", redacted)
+    redacted = INLINE_COOKIE_RE.sub(r"\1[REDACTED]", redacted)
+    redacted = TOKEN_ASSIGNMENT_RE.sub(r"\1\2[REDACTED]", redacted)
     redacted = QUOTED_SENSITIVE_ASSIGNMENT_RE.sub(
         lambda m: f"{m.group(1)}{m.group(3)}[REDACTED]{m.group(3)}",
         redacted,

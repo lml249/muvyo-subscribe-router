@@ -7,8 +7,8 @@
 1. **事件监听与保守完结判定**
    - 监听 `EventType.SubscribeAdded`。
    - 电视剧结合 `mediainfo`（若 `mediainfo` 缺失或缺少 `status`/目标季信息，则通过 `TmdbChain` 兜底补全）检查 `status`、`next_episode_to_air`、`season_info`、`last_air_date` 与预期集数：
-     - 连载中（`Returning Series` / `In Production` / `Planned`）的**当前季/未来季**、存在待播集或状态未知时直接放行，保持 `state='N'` 走 PT 追更。
-     - 剧集已完结（`Ended` / `Canceled`），或连载剧的**已播完历史季**（默认允许，且后续季已开播、预期集数明确）进入分流。
+     - 连载中（`Returning Series` / `In Production` / `Planned`）存在当前季待播集、尚未开播新季（`season_air_date > last_air_date`）或状态未知时直接放行，保持 `state='N'` 走 PT 追更，并写入 `passthrough_pt` 处理历史与脱敏日志（不发送通知）。
+     - 剧集已完结（`Ended` / `Canceled`），或连载剧的**已播完历史季**（默认允许，目标季已开播、预期集数明确，且下一季已开播或 `next_episode_to_air` 已指向更晚季），或开启 `allow_completed_latest_season`（默认开启）时的**最新季静默完播**（无 `next_episode_to_air`、目标季已开播且 `last_air_date` 距今不少于 `latest_season_quiet_days` 天，默认 30 天）进入分流。
    - 默认跳过洗版（`best_version`）和多版本订阅（`version_rules`），可按用户名白名单/黑名单过滤。
 2. **防竞态暂停与后台异步执行**
    - 命中条件后**同步**调用 `SubscribeOper().update(subscribe_id, {"state": "S"})` 暂停订阅并加 `subscribe_id` 去重锁，阻止 MoviePilot 定时搜索并发抢下 PT。
@@ -41,6 +41,8 @@
 | `subtitle_policy` | 内封中文字幕门禁策略 | `auto` / `required` |
 | `on_subtitle_gate_fail` | 字幕门禁失败时的订阅动作（不删云盘文件） | `keep_paused` / `fallback_pt` |
 | `on_success_action` | 分流成功后订阅动作 | `complete` / `pause` |
+| `allow_completed_latest_season` | 连载剧最新季静默完播分流开关 | `true` |
+| `latest_season_quiet_days` | 连载剧最新季静默完播判定天数（7-365） | `30` |
 | `dry_run` | 仅执行到盘搜与分享预览，不落云盘 | `false` |
 
 ## 安全边界
