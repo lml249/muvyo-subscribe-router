@@ -158,7 +158,7 @@ class MuvyoSubscribeRouter(_PluginBase):
     plugin_name = "Muvyo 完结订阅分流"
     plugin_desc = "监听 MoviePilot 新增订阅，对已完结剧集（及可选电影）优先通过外置 Muvyo/MV3 盘搜、115 转存、内封中文字幕门禁与整理生成 STRM，失败无缝回退 PT。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/cloud.png"
-    plugin_version = "0.2"
+    plugin_version = "0.2.1"
     plugin_author = "lml249"
     author_url = "https://github.com/lml249/muvyo-subscribe-router"
     plugin_config_prefix = "muvyosubscriberouter_"

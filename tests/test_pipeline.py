@@ -10,7 +10,7 @@ PLUGINS_ROOT = Path(__file__).resolve().parents[1] / "plugins.v2"
 if str(PLUGINS_ROOT) not in sys.path:
     sys.path.insert(0, str(PLUGINS_ROOT))
 
-from muvyosubscriberouter.client import MuvyoClient
+from muvyosubscriberouter.client import MuvyoClient, MuvyoClientError
 from muvyosubscriberouter.completion import CompletionDecision
 from muvyosubscriberouter.pipeline import (
     PipelineResult,
@@ -27,6 +27,7 @@ class _FakePipelineClient:
         api_key: str = "",
         has_results: bool = True,
         staged_items: List[Dict[str, Any]] | None = None,
+        browse_cloud_side_effects: List[Any] | None = None,
         organize_ok: bool = True,
         organize_blockers: List[str] | None = None,
         resolved_target_dirs: List[str] | None = None,
@@ -44,6 +45,10 @@ class _FakePipelineClient:
             {"fn": "Demo.S01E01.mkv", "fid": "v1", "pickcode": "pc_secret_1"},
             {"fn": "Demo.S01E02.mkv", "fid": "v2", "pickcode": "pc_secret_2"},
         ]
+        self.browse_cloud_side_effects = (
+            list(browse_cloud_side_effects) if browse_cloud_side_effects is not None else None
+        )
+        self._browse_cloud_index = 0
         self.calls: List[str] = []
         self.ensured_paths: List[str] = []
         self.received_paths: List[str] = []
@@ -83,6 +88,13 @@ class _FakePipelineClient:
 
     def browse_cloud_folder(self, folder_id: str = "", path: str = "", limit: int = 1150) -> Dict[str, Any]:
         self.calls.append("browse_cloud")
+        if self.browse_cloud_side_effects is not None:
+            idx = min(self._browse_cloud_index, len(self.browse_cloud_side_effects) - 1)
+            self._browse_cloud_index += 1
+            effect = self.browse_cloud_side_effects[idx]
+            if isinstance(effect, Exception):
+                raise effect
+            return dict(effect)
         return {"ok": True, "folder_id": folder_id, "items": list(self.staged_items)}
 
     def build_redirect_probe_url(self, cloud_path: str, pickcode: str) -> str:
@@ -384,6 +396,272 @@ class TestPipeline(unittest.TestCase):
             staging_path="/未整理/mp-router/RAW_MV_API_KEY_999",
         ).to_sanitized_dict(extra_secrets=["RAW_MV_API_KEY_999"])
         self.assertNotIn("RAW_MV_API_KEY_999", json.dumps(explicit_res, ensure_ascii=False))
+
+    def test_staging_settle_waits_for_delayed_115_items(self) -> None:
+        client = _FakePipelineClient(
+            browse_cloud_side_effects=[
+                {"ok": True, "folder_id": "staging_fid_9", "items": []},
+                {
+                    "ok": True,
+                    "folder_id": "staging_fid_9",
+                    "items": [{"fn": "Demo.S01E01.mkv", "fid": "v1", "pickcode": "pc_secret_1"}],
+                },
+                {
+                    "ok": True,
+                    "folder_id": "staging_fid_9",
+                    "items": [
+                        {"fn": "Demo.S01E01.mkv", "fid": "v1", "pickcode": "pc_secret_1"},
+                        {"fn": "Demo.S01E02.mkv", "fid": "v2", "pickcode": "pc_secret_2"},
+                    ],
+                },
+            ]
+        )
+        decision = CompletionDecision(
+            eligible=True, reason="tv_series_ended", media_kind="tv", season=1, expected_episodes=2, title="演示剧集"
+        )
+        cfg = RouterPipelineConfig(staging_settle_max_attempts=6, staging_settle_interval_seconds=2.0)
+        sleep_calls: List[float] = []
+
+        def _probe(tool: str, url: str, timeout: int):
+            return {
+                "ok": True,
+                "audio_streams": [{"language": "eng", "title": "English"}],
+                "subtitle_streams": [{"language": "zh-cn", "title": "简体中文"}],
+            }
+
+        res = run_muvyo_routing_pipeline(
+            client,  # type: ignore[arg-type]
+            decision,
+            tmdb_id=3010,
+            config=cfg,
+            run_id="r10",
+            probe_runner=_probe,
+            sleep_fn=sleep_calls.append,
+        )
+        self.assertEqual(res.status, "routed_ok")
+        self.assertEqual(client.calls.count("browse_cloud"), 3)
+        self.assertEqual(sleep_calls, [2.0, 2.0])
+        self.assertEqual(res.diagnostics.get("staging_browse_attempts"), 3)
+        self.assertIn("organize_transfer", client.calls)
+
+    def test_staging_settle_exits_immediately_when_complete_on_first_browse(self) -> None:
+        client = _FakePipelineClient()
+        decision = CompletionDecision(
+            eligible=True, reason="tv_series_ended", media_kind="tv", season=1, expected_episodes=2, title="演示剧集"
+        )
+        cfg = RouterPipelineConfig(staging_settle_max_attempts=6, staging_settle_interval_seconds=2.0)
+        sleep_calls: List[float] = []
+
+        def _probe(tool: str, url: str, timeout: int):
+            return {
+                "ok": True,
+                "audio_streams": [{"language": "eng", "title": "English"}],
+                "subtitle_streams": [{"language": "zh-cn", "title": "简体中文"}],
+            }
+
+        res = run_muvyo_routing_pipeline(
+            client,  # type: ignore[arg-type]
+            decision,
+            tmdb_id=3011,
+            config=cfg,
+            run_id="r11",
+            probe_runner=_probe,
+            sleep_fn=sleep_calls.append,
+        )
+        self.assertEqual(res.status, "routed_ok")
+        self.assertEqual(client.calls.count("browse_cloud"), 1)
+        self.assertEqual(sleep_calls, [])
+        self.assertEqual(res.diagnostics.get("staging_browse_attempts"), 1)
+
+    def test_staging_settle_exhausted_returns_incomplete_without_organize(self) -> None:
+        client = _FakePipelineClient(
+            staged_items=[{"fn": "Demo.S01E01.mkv", "fid": "v1", "pickcode": "pc_secret_1"}]
+        )
+        decision = CompletionDecision(
+            eligible=True, reason="tv_series_ended", media_kind="tv", season=1, expected_episodes=2, title="演示剧集"
+        )
+        cfg = RouterPipelineConfig(staging_settle_max_attempts=4, staging_settle_interval_seconds=1.5)
+        sleep_calls: List[float] = []
+
+        res = run_muvyo_routing_pipeline(
+            client,  # type: ignore[arg-type]
+            decision,
+            tmdb_id=3012,
+            config=cfg,
+            run_id="r12",
+            sleep_fn=sleep_calls.append,
+        )
+        self.assertEqual(res.status, "manual_review_staging")
+        self.assertEqual(res.reason, "staging_episode_coverage_incomplete")
+        self.assertEqual(client.calls.count("browse_cloud"), 4)
+        self.assertEqual(sleep_calls, [1.5, 1.5, 1.5])
+        self.assertEqual(res.diagnostics.get("staging_browse_attempts"), 4)
+        self.assertNotIn("organize_transfer", client.calls)
+
+    def test_staging_settle_aborts_when_stopped_during_wait(self) -> None:
+        client = _FakePipelineClient(
+            staged_items=[{"fn": "Demo.S01E01.mkv", "fid": "v1", "pickcode": "pc_secret_1"}]
+        )
+        decision = CompletionDecision(
+            eligible=True, reason="tv_series_ended", media_kind="tv", season=1, expected_episodes=2, title="演示剧集"
+        )
+        cfg = RouterPipelineConfig(staging_settle_max_attempts=5, staging_settle_interval_seconds=2.0)
+        stopped = False
+        sleep_calls: List[float] = []
+
+        def _sleep_and_stop(seconds: float) -> None:
+            nonlocal stopped
+            sleep_calls.append(seconds)
+            stopped = True
+
+        res = run_muvyo_routing_pipeline(
+            client,  # type: ignore[arg-type]
+            decision,
+            tmdb_id=3013,
+            config=cfg,
+            run_id="r13",
+            should_stop=lambda: stopped,
+            sleep_fn=_sleep_and_stop,
+        )
+        self.assertEqual(res.status, "manual_review_staging")
+        self.assertEqual(res.reason, "plugin_stopped_during_staging_settle")
+        self.assertEqual(client.calls.count("browse_cloud"), 1)
+        self.assertEqual(sleep_calls, [2.0])
+        self.assertEqual(res.diagnostics.get("stage"), "staging_settle")
+        self.assertEqual(res.diagnostics.get("staging_browse_attempts"), 1)
+        self.assertNotIn("organize_transfer", client.calls)
+
+    def test_staging_settle_recovers_from_transient_browse_error(self) -> None:
+        client = _FakePipelineClient(
+            browse_cloud_side_effects=[
+                MuvyoClientError("temporary_timeout"),
+                {
+                    "ok": True,
+                    "folder_id": "staging_fid_9",
+                    "items": [
+                        {"fn": "Demo.S01E01.mkv", "fid": "v1", "pickcode": "pc_secret_1"},
+                        {"fn": "Demo.S01E02.mkv", "fid": "v2", "pickcode": "pc_secret_2"},
+                    ],
+                },
+            ]
+        )
+        decision = CompletionDecision(
+            eligible=True, reason="tv_series_ended", media_kind="tv", season=1, expected_episodes=2, title="演示剧集"
+        )
+        cfg = RouterPipelineConfig(staging_settle_max_attempts=4, staging_settle_interval_seconds=1.0)
+        sleep_calls: List[float] = []
+
+        def _probe(tool: str, url: str, timeout: int):
+            return {
+                "ok": True,
+                "audio_streams": [{"language": "eng", "title": "English"}],
+                "subtitle_streams": [{"language": "zh-cn", "title": "简体中文"}],
+            }
+
+        res = run_muvyo_routing_pipeline(
+            client,  # type: ignore[arg-type]
+            decision,
+            tmdb_id=3014,
+            config=cfg,
+            run_id="r14",
+            probe_runner=_probe,
+            sleep_fn=sleep_calls.append,
+        )
+        self.assertEqual(res.status, "routed_ok")
+        self.assertEqual(client.calls.count("browse_cloud"), 2)
+        self.assertEqual(sleep_calls, [1.0])
+        self.assertEqual(res.diagnostics.get("staging_browse_attempts"), 2)
+        self.assertIn("organize_transfer", client.calls)
+
+    def test_staging_settle_stop_after_complete_browse_skips_subtitle_gate(self) -> None:
+        client = _FakePipelineClient(
+            browse_cloud_side_effects=[
+                {
+                    "ok": True,
+                    "folder_id": "staging_fid_9",
+                    "items": [{"fn": "Demo.S01E01.mkv", "fid": "v1", "pickcode": "pc_secret_1"}],
+                },
+                {
+                    "ok": True,
+                    "folder_id": "staging_fid_9",
+                    "items": [
+                        {"fn": "Demo.S01E01.mkv", "fid": "v1", "pickcode": "pc_secret_1"},
+                        {"fn": "Demo.S01E02.mkv", "fid": "v2", "pickcode": "pc_secret_2"},
+                    ],
+                },
+            ]
+        )
+        decision = CompletionDecision(
+            eligible=True, reason="tv_series_ended", media_kind="tv", season=1, expected_episodes=2, title="演示剧集"
+        )
+        cfg = RouterPipelineConfig(staging_settle_max_attempts=4, staging_settle_interval_seconds=1.0)
+        sleep_calls: List[float] = []
+        probe_calls = 0
+
+        def _probe(tool: str, url: str, timeout: int):
+            nonlocal probe_calls
+            probe_calls += 1
+            return {
+                "ok": True,
+                "audio_streams": [{"language": "eng", "title": "English"}],
+                "subtitle_streams": [{"language": "zh-cn", "title": "简体中文"}],
+            }
+
+        res = run_muvyo_routing_pipeline(
+            client,  # type: ignore[arg-type]
+            decision,
+            tmdb_id=3015,
+            config=cfg,
+            run_id="r15",
+            probe_runner=_probe,
+            should_stop=lambda: client.calls.count("browse_cloud") >= 2,
+            sleep_fn=sleep_calls.append,
+        )
+        self.assertEqual(res.status, "manual_review_staging")
+        self.assertEqual(res.reason, "plugin_stopped_during_staging_settle")
+        self.assertEqual(probe_calls, 0)
+        self.assertNotIn("organize_transfer", client.calls)
+        self.assertEqual(client.calls.count("browse_cloud"), 2)
+        self.assertEqual(sleep_calls, [1.0])
+        self.assertEqual(res.video_count, 2)
+        self.assertEqual(res.episodes, [1, 2])
+        self.assertEqual(res.diagnostics.get("staging_browse_attempts"), 2)
+
+    def test_staging_settle_not_ok_response_preserves_previous_snapshot(self) -> None:
+        client = _FakePipelineClient(
+            browse_cloud_side_effects=[
+                {
+                    "ok": True,
+                    "folder_id": "staging_fid_9",
+                    "items": [{"fn": "Demo.S01E01.mkv", "fid": "v1", "pickcode": "pc_secret_1"}],
+                },
+                {"ok": False, "status": 503, "items": []},
+                {"ok": False, "status": 503, "items": []},
+            ]
+        )
+        decision = CompletionDecision(
+            eligible=True, reason="tv_series_ended", media_kind="tv", season=1, expected_episodes=2, title="演示剧集"
+        )
+        cfg = RouterPipelineConfig(staging_settle_max_attempts=3, staging_settle_interval_seconds=1.0)
+        sleep_calls: List[float] = []
+
+        res = run_muvyo_routing_pipeline(
+            client,  # type: ignore[arg-type]
+            decision,
+            tmdb_id=3016,
+            config=cfg,
+            run_id="r16",
+            sleep_fn=sleep_calls.append,
+        )
+        self.assertEqual(res.status, "manual_review_staging")
+        self.assertEqual(res.reason, "staging_episode_coverage_incomplete")
+        self.assertEqual(res.video_count, 1)
+        self.assertEqual(res.episodes, [1])
+        self.assertEqual(client.calls.count("browse_cloud"), 3)
+        self.assertEqual(sleep_calls, [1.0, 1.0])
+        self.assertEqual(res.diagnostics.get("staging_browse_attempts"), 3)
+        self.assertEqual(res.diagnostics.get("last_browse_not_ok"), 503)
+        self.assertNotIn("organize_transfer", client.calls)
 
 
 if __name__ == "__main__":

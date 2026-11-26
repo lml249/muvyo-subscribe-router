@@ -138,6 +138,8 @@ class RouterPipelineConfig:
     max_drill_depth: int = 3
     trigger_strm_generate: bool = False
     dry_run: bool = False
+    staging_settle_max_attempts: int = 6
+    staging_settle_interval_seconds: float = 2.0
 
 
 @dataclass
@@ -181,6 +183,7 @@ def run_muvyo_routing_pipeline(
     run_id: str = "",
     probe_runner: Optional[ProbeRunner] = None,
     should_stop: Optional[Callable[[], bool]] = None,
+    sleep_fn: Optional[Callable[[float], None]] = None,
 ) -> PipelineResult:
     """
     Execute the end-to-end Muvyo routing pipeline for a single completed subscription:
@@ -327,38 +330,139 @@ def run_muvyo_routing_pipeline(
             staging_path=staging_path,
         )
 
-    # Step E: Browse staging + verify coverage + embedded Chinese subtitle gate
-    try:
-        browse_res = client.browse_cloud_folder(folder_id=staging_folder_id, path=staging_path)
-    except MuvyoClientError as exc:
-        return PipelineResult(
-            status="manual_review_staging",
-            reason=f"staging_browse_failed:{redact_exception(exc, extra_secrets=extra_secrets)}",
-            staging_path=staging_path,
-        )
+    # Step E: Browse staging (with settle polling for 115 eventual consistency) + verify coverage + embedded Chinese subtitle gate
+    max_attempts = max(1, int(config.staging_settle_max_attempts))
+    settle_interval = max(0.0, float(config.staging_settle_interval_seconds))
+    sleeper = sleep_fn if sleep_fn is not None else time.sleep
+    expected_min_videos = max(1, int(getattr(plan, "video_count", 0) or 0))
+    expected_ep_set = (
+        set(range(1, decision.expected_episodes + 1))
+        if (decision.media_kind == "tv" and decision.expected_episodes > 0)
+        else set()
+    )
 
-    rows = browse_res.get("items", []) if browse_res.get("ok") else []
     staged_videos: List[Dict[str, Any]] = []
     staged_sub_sidecars: List[Dict[str, Any]] = []
-    for row in rows:
-        if item_is_folder(row):
-            continue
-        kind = classify_media_kind(item_name(row))
-        if kind == "video":
-            staged_videos.append(row)
-        elif kind == "subtitle_sidecar":
-            staged_sub_sidecars.append(row)
+    staged_episodes: List[int] = []
+    has_browse_ok = False
+    last_browse_exc: Optional[MuvyoClientError] = None
+    last_browse_not_ok: Optional[Any] = None
+    staging_browse_attempts = 0
+
+    for attempt in range(1, max_attempts + 1):
+        staging_browse_attempts = attempt
+        try:
+            browse_res = client.browse_cloud_folder(folder_id=staging_folder_id, path=staging_path)
+        except MuvyoClientError as exc:
+            last_browse_exc = exc
+        else:
+            last_browse_exc = None
+            if browse_res.get("ok"):
+                has_browse_ok = True
+                last_browse_not_ok = None
+                rows = browse_res.get("items", [])
+                cur_videos: List[Dict[str, Any]] = []
+                cur_sub_sidecars: List[Dict[str, Any]] = []
+                cur_episodes: List[int] = []
+                for row in rows:
+                    if item_is_folder(row):
+                        continue
+                    fname = item_name(row)
+                    kind = classify_media_kind(fname)
+                    if kind == "video":
+                        cur_videos.append(row)
+                        _, ep = extract_season_and_episode(fname)
+                        if ep is not None and ep > 0:
+                            cur_episodes.append(ep)
+                    elif kind == "subtitle_sidecar":
+                        cur_sub_sidecars.append(row)
+
+                staged_videos = cur_videos
+                staged_sub_sidecars = cur_sub_sidecars
+                staged_episodes = cur_episodes
+
+                is_complete = len(staged_videos) >= expected_min_videos and (
+                    not expected_ep_set or expected_ep_set.issubset(set(staged_episodes))
+                )
+                if _stopped():
+                    return PipelineResult(
+                        status="manual_review_staging",
+                        reason="plugin_stopped_during_staging_settle",
+                        staging_path=staging_path,
+                        video_count=len(staged_videos),
+                        episodes=sorted(set(staged_episodes)),
+                        diagnostics={
+                            "stage": "staging_settle",
+                            "staging_browse_attempts": staging_browse_attempts,
+                        },
+                    )
+                if is_complete:
+                    break
+            else:
+                raw_not_ok = browse_res.get("status")
+                if raw_not_ok is None:
+                    raw_not_ok = browse_res.get("error") or "not_ok"
+                last_browse_not_ok = (
+                    raw_not_ok
+                    if isinstance(raw_not_ok, int)
+                    else redact_sensitive_text(str(raw_not_ok), max_length=200, extra_secrets=extra_secrets)
+                )
+
+        if attempt < max_attempts:
+            if _stopped():
+                return PipelineResult(
+                    status="manual_review_staging",
+                    reason="plugin_stopped_during_staging_settle",
+                    staging_path=staging_path,
+                    video_count=len(staged_videos),
+                    episodes=sorted(set(staged_episodes)),
+                    diagnostics={
+                        "stage": "staging_settle",
+                        "staging_browse_attempts": attempt,
+                    },
+                )
+            if settle_interval > 0:
+                sleeper(settle_interval)
+                if _stopped():
+                    return PipelineResult(
+                        status="manual_review_staging",
+                        reason="plugin_stopped_during_staging_settle",
+                        staging_path=staging_path,
+                        video_count=len(staged_videos),
+                        episodes=sorted(set(staged_episodes)),
+                        diagnostics={
+                            "stage": "staging_settle",
+                            "staging_browse_attempts": attempt,
+                        },
+                    )
+
+    if not has_browse_ok and last_browse_exc is not None:
+        return PipelineResult(
+            status="manual_review_staging",
+            reason=f"staging_browse_failed:{redact_exception(last_browse_exc, extra_secrets=extra_secrets)}",
+            staging_path=staging_path,
+            diagnostics={
+                "stage": "staging_settle",
+                "staging_browse_attempts": staging_browse_attempts,
+            },
+        )
 
     if not staged_videos:
+        empty_diag: Dict[str, Any] = {
+            "stage": "staging_settle",
+            "staging_browse_attempts": staging_browse_attempts,
+        }
+        if last_browse_not_ok is not None:
+            empty_diag["last_browse_not_ok"] = last_browse_not_ok
         return PipelineResult(
             status="manual_review_staging",
             reason="staging_contains_no_videos",
             staging_path=staging_path,
+            diagnostics=empty_diag,
         )
 
     probe_targets: List[Dict[str, Any]] = []
     organize_files: List[Dict[str, Any]] = []
-    staged_episodes: List[int] = []
     for row in staged_videos:
         fname = item_name(row)
         fid = item_file_id(row)
@@ -367,8 +471,6 @@ def run_muvyo_routing_pipeline(
         ).strip()
         cloud_file_path = f"{staging_path}/{fname}"
         _, ep = extract_season_and_episode(fname)
-        if ep is not None and ep > 0:
-            staged_episodes.append(ep)
         probe_url = client.build_redirect_probe_url(cloud_file_path, pickcode)
         probe_targets.append({"name": fname, "episode": ep, "probe_url": probe_url})
         organize_files.append({
@@ -378,16 +480,34 @@ def run_muvyo_routing_pipeline(
             "is_cloud_source": True,
         })
 
-    if decision.media_kind == "tv" and decision.expected_episodes > 0:
-        expected_set = set(range(1, decision.expected_episodes + 1))
-        if not expected_set.issubset(set(staged_episodes)):
-            return PipelineResult(
-                status="manual_review_staging",
-                reason="staging_episode_coverage_incomplete",
-                staging_path=staging_path,
-                video_count=len(staged_videos),
-                episodes=sorted(set(staged_episodes)),
-            )
+    if expected_ep_set and not expected_ep_set.issubset(set(staged_episodes)):
+        incomplete_diag: Dict[str, Any] = {
+            "stage": "staging_settle",
+            "staging_browse_attempts": staging_browse_attempts,
+        }
+        if last_browse_not_ok is not None:
+            incomplete_diag["last_browse_not_ok"] = last_browse_not_ok
+        return PipelineResult(
+            status="manual_review_staging",
+            reason="staging_episode_coverage_incomplete",
+            staging_path=staging_path,
+            video_count=len(staged_videos),
+            episodes=sorted(set(staged_episodes)),
+            diagnostics=incomplete_diag,
+        )
+
+    if _stopped():
+        return PipelineResult(
+            status="manual_review_staging",
+            reason="plugin_stopped_before_subtitle_gate",
+            staging_path=staging_path,
+            video_count=len(staged_videos),
+            episodes=sorted(set(staged_episodes)),
+            diagnostics={
+                "stage": "staging_settle",
+                "staging_browse_attempts": staging_browse_attempts,
+            },
+        )
 
     sub_audit = evaluate_embedded_subtitle_gate(
         probe_targets,
@@ -412,7 +532,10 @@ def run_muvyo_routing_pipeline(
             video_count=len(staged_videos),
             episodes=sorted(set(staged_episodes)),
             subtitle_audit=safe_sub_audit,
-            diagnostics={"stage": "subtitle_gate"},
+            diagnostics={
+                "stage": "subtitle_gate",
+                "staging_browse_attempts": staging_browse_attempts,
+            },
         )
 
     if _stopped():
@@ -423,6 +546,7 @@ def run_muvyo_routing_pipeline(
             video_count=len(staged_videos),
             episodes=sorted(set(staged_episodes)),
             subtitle_audit=sub_audit,
+            diagnostics={"staging_browse_attempts": staging_browse_attempts},
         )
 
     # Step F: Organize transfer + optional explicit STRM generate (strictly scoped)
@@ -449,6 +573,7 @@ def run_muvyo_routing_pipeline(
             video_count=len(staged_videos),
             episodes=sorted(set(staged_episodes)),
             subtitle_audit=sub_audit,
+            diagnostics={"staging_browse_attempts": staging_browse_attempts},
         )
 
     if not org_res.get("ok"):
@@ -465,7 +590,11 @@ def run_muvyo_routing_pipeline(
             video_count=len(staged_videos),
             episodes=sorted(set(staged_episodes)),
             subtitle_audit=sub_audit,
-            diagnostics={"stage": "organize_transfer", "blockers": org_blockers},
+            diagnostics={
+                "stage": "organize_transfer",
+                "blockers": org_blockers,
+                "staging_browse_attempts": staging_browse_attempts,
+            },
         )
 
     strm_generated = False
@@ -479,6 +608,7 @@ def run_muvyo_routing_pipeline(
                 video_count=len(staged_videos),
                 episodes=sorted(set(staged_episodes)),
                 subtitle_audit=sub_audit,
+                diagnostics={"staging_browse_attempts": staging_browse_attempts},
             )
         resolved_dirs = [
             normalize_cloud_path(d)
@@ -498,6 +628,7 @@ def run_muvyo_routing_pipeline(
                         video_count=len(staged_videos),
                         episodes=sorted(set(staged_episodes)),
                         subtitle_audit=sub_audit,
+                        diagnostics={"staging_browse_attempts": staging_browse_attempts},
                     )
                 try:
                     strm_res = client.generate_strm(
@@ -515,6 +646,7 @@ def run_muvyo_routing_pipeline(
                             video_count=len(staged_videos),
                             episodes=sorted(set(staged_episodes)),
                             subtitle_audit=sub_audit,
+                            diagnostics={"staging_browse_attempts": staging_browse_attempts},
                         )
                     strm_generated = True
                 except MuvyoClientError as exc:
@@ -525,6 +657,7 @@ def run_muvyo_routing_pipeline(
                         video_count=len(staged_videos),
                         episodes=sorted(set(staged_episodes)),
                         subtitle_audit=sub_audit,
+                        diagnostics={"staging_browse_attempts": staging_browse_attempts},
                     )
 
     return PipelineResult(
@@ -538,6 +671,7 @@ def run_muvyo_routing_pipeline(
             "stage": "done",
             "title_hash": plan.title_hash,
             "excluded_metadata_count": plan.excluded_metadata_count,
+            "staging_browse_attempts": staging_browse_attempts,
             "strm_generate_called": strm_generated,
             "warnings": strm_warnings,
         },

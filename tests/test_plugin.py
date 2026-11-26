@@ -107,8 +107,9 @@ class TestPluginLifecycle(unittest.TestCase):
         package_path = Path(__file__).resolve().parents[1] / "package.v2.json"
         manifest = json.loads(package_path.read_text(encoding="utf-8"))
         entry = manifest["MuvyoSubscribeRouter"]
-        self.assertEqual(MuvyoSubscribeRouter.plugin_version, "0.2")
+        self.assertEqual(MuvyoSubscribeRouter.plugin_version, "0.2.1")
         self.assertEqual(entry["version"], MuvyoSubscribeRouter.plugin_version)
+        self.assertIn("v0.2.1", entry["history"])
         self.assertIn("v0.2", entry["history"])
         self.assertIn("v0.1", entry["history"])
 

@@ -3,12 +3,13 @@
     "name": "Muvyo 完结订阅分流",
     "description": "监听 MoviePilot 新增订阅，对已完结剧集（及可选电影）优先通过外置 Muvyo/MV3 盘搜、115 转存、内封中文字幕门禁与整理生成 STRM，失败无缝回退 PT。",
     "labels": "订阅,网盘,STRM",
-    "version": "0.2",
+    "version": "0.2.1",
     "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/cloud.png",
     "author": "lml249",
     "level": 2,
     "v2": true,
     "history": {
+      "v0.2.1": "修复 115 分享转存后 staging 目录落盘延迟误判：浏览 staging 增加有界轮询等待与停止信号检查，并记录 staging_browse_attempts 诊断计数。",
       "v0.2": "增强剧集完结判定：支持下一待播集指向更晚季的历史季分流与连载剧最新季静默完播分流（可配置静默天数），新增直通放行 PT 历史记录与脱敏调度日志。",
       "v0.1": "初始版本：支持完结剧集与可选电影 Muvyo/MV3 优先分流、防竞态暂停与无缝回退 PT、内封中文字幕门禁、路径守卫与统一脱敏。"
     }

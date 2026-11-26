@@ -18,7 +18,7 @@
    - 校验季号与集数完整性，自动排除 `.nfo/.jpg/.jpeg/.png/.webp` 元数据旁挂。
    - 先通过 `POST /api/v1/files/115/folder` 逐级确保独立子目录（如 `/未整理/mp-router/<标题>_tmdb<id>_s<季>_<run_id>`），再调用 `POST /api/v1/share-transfer/receive` 接收视频和字幕旁挂。
 4. **内封中文字幕门禁（外挂字幕不可替代）**
-   - 浏览 staging 目录拿到视频的 `file_id` 与内存态 `pickcode`，构造临时 `/redirect` URL 交由 `ffprobe` 探测内封音频流与字幕流（绝不写入日志、通知或持久化数据）。
+   - 浏览 staging 目录（支持对 115 转存后的异步落盘执行有界轮询等待，默认最多 6 次、间隔 2 秒）拿到视频的 `file_id` 与内存态 `pickcode`，构造临时 `/redirect` URL 交由 `ffprobe` 探测内封音频流与字幕流（绝不写入日志、通知或持久化数据）。
    - `auto`（默认）：外语音轨每集须含内封中文字幕；中文/国语/粤语音轨可豁免并记录诊断。
    - `required`：每集必须含内封中文字幕。
    - **门禁不通过或 `ffprobe` 缺失**：立即停止在 staging 等待人工复核，**严禁整理、严禁生成 STRM、严禁自动删除已接收的 staging 文件**。
