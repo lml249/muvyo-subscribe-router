@@ -192,9 +192,56 @@ def _organize_status_is_blocked(status: str) -> bool:
     return any(tok in norm for tok in bad_tokens)
 
 
-def _evaluate_organize_outcome(payload: Any, *, expected_file_count: int, target_dir: str) -> Dict[str, Any]:
+_PURE_CATEGORY_SEGMENTS = {
+    "anime",
+    "series",
+    "tv",
+    "movies",
+    "movie",
+    "kids",
+    "documentary",
+    "documentaries",
+    "variety",
+    "电视剧",
+    "电影",
+    "动漫",
+    "动画",
+    "剧集",
+    "儿童",
+    "综艺",
+    "纪录片",
+}
+
+
+def _normalize_slash_path(path: Any) -> str:
+    raw = str(path or "").strip().replace("\\", "/")
+    if not raw:
+        return ""
+    parts = [p for p in raw.split("/") if p]
+    if not parts or any(p in {".", ".."} for p in parts):
+        return ""
+    return "/" + "/".join(parts)
+
+
+def _is_pure_category_rel(rel_path: str) -> bool:
+    segs = [s.strip().lower() for s in str(rel_path or "").split("/") if s.strip()]
+    return bool(segs) and all(seg in _PURE_CATEGORY_SEGMENTS for seg in segs)
+
+
+def _evaluate_organize_outcome(
+    payload: Any,
+    *,
+    expected_file_count: int,
+    target_dir: str,
+    strm_dir: str = "",
+) -> Dict[str, Any]:
     if not isinstance(payload, dict):
-        return {"ok": True, "blockers": [], "resolved_target_dirs": []}
+        return {
+            "ok": True,
+            "blockers": [],
+            "resolved_target_dirs": [],
+            "resolved_strm_dirs": [],
+        }
 
     counts: Dict[str, int] = {}
     for key in ("success", "failed", "skipped"):
@@ -216,7 +263,22 @@ def _evaluate_organize_outcome(payload: Any, *, expected_file_count: int, target
 
     items = payload.get("items")
     resolved_dirs: List[str] = []
-    norm_root = "/" + "/".join(p for p in str(target_dir or "").strip().replace("\\", "/").split("/") if p)
+    item_strm_dirs: List[str] = []
+    norm_root = _normalize_slash_path(target_dir)
+    norm_strm_root = _normalize_slash_path(strm_dir)
+
+    def _record_strm_dir(candidate: str, bucket: List[str]) -> None:
+        norm_cand = _normalize_slash_path(candidate)
+        if (
+            norm_strm_root
+            and norm_cand
+            and norm_cand != norm_strm_root
+            and norm_cand.startswith(norm_strm_root + "/")
+        ):
+            rel = norm_cand[len(norm_strm_root) + 1:].strip("/")
+            if rel and not _is_pure_category_rel(rel) and norm_cand not in bucket:
+                bucket.append(norm_cand)
+
     if isinstance(items, list):
         for row in items:
             if not isinstance(row, dict):
@@ -226,22 +288,35 @@ def _evaluate_organize_outcome(payload: Any, *, expected_file_count: int, target
                 blockers.append("organize_blocked_item_status")
             new_path = str(row.get("new_path") or row.get("target_path") or "").strip().replace("\\", "/")
             if new_path and "/" in new_path:
-                parent_dir = new_path.rsplit("/", 1)[0]
+                parent_dir = _normalize_slash_path(new_path.rsplit("/", 1)[0])
                 if parent_dir and parent_dir != norm_root and (not norm_root or parent_dir.startswith(norm_root + "/")):
                     if parent_dir not in resolved_dirs:
                         resolved_dirs.append(parent_dir)
+            item_strm_dir = str(row.get("strm_dir") or "").strip().replace("\\", "/")
+            if item_strm_dir:
+                _record_strm_dir(item_strm_dir, item_strm_dirs)
+            item_strm_path = str(row.get("strm_path") or "").strip().replace("\\", "/")
+            if item_strm_path and "/" in item_strm_path:
+                _record_strm_dir(item_strm_path.rsplit("/", 1)[0], item_strm_dirs)
 
     for top_key in ("dest_dir", "output_dir", "organized_dir"):
-        val = str(payload.get(top_key) or "").strip().replace("\\", "/").rstrip("/")
+        val = _normalize_slash_path(payload.get(top_key))
         if val and val != norm_root and (not norm_root or val.startswith(norm_root + "/")):
             if val not in resolved_dirs:
                 resolved_dirs.append(val)
+
+    resolved_strm_dirs: List[str] = list(item_strm_dirs)
+    if not resolved_strm_dirs:
+        top_strm_dir = str(payload.get("strm_dir") or "").strip().replace("\\", "/")
+        if top_strm_dir:
+            _record_strm_dir(top_strm_dir, resolved_strm_dirs)
 
     return {
         "ok": not blockers,
         "counts": counts,
         "blockers": sorted(set(blockers)),
         "resolved_target_dirs": resolved_dirs,
+        "resolved_strm_dirs": resolved_strm_dirs,
     }
 
 
@@ -568,7 +643,10 @@ class MuvyoClient:
         }
         res = self._request_json("POST", "/api/v1/organize/transfer", body, timeout=timeout)
         outcome = _evaluate_organize_outcome(
-            res["payload"], expected_file_count=len(files), target_dir=target_dir
+            res["payload"],
+            expected_file_count=len(files),
+            target_dir=target_dir,
+            strm_dir=strm_dir,
         )
         return {
             "ok": bool(res["ok"]) and bool(outcome["ok"]),
@@ -576,6 +654,7 @@ class MuvyoClient:
             "outcome": outcome,
             "blockers": outcome["blockers"],
             "resolved_target_dirs": outcome["resolved_target_dirs"],
+            "resolved_strm_dirs": outcome["resolved_strm_dirs"],
             "response": redact_sensitive_data(res["payload"], extra_secrets=[self.api_key]),
         }
 

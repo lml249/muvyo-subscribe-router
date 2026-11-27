@@ -16,14 +16,16 @@
 3. **盘搜、筛选与 115 Staging 隔离接收**
    - 调用 `POST /api/v1/resource-search/search` → `POST /api/v1/share-transfer/parse` → `POST /api/v1/share-transfer/browse`（支持有界季目录/单目录自动下钻）。
    - 校验季号与集数完整性，自动排除 `.nfo/.jpg/.jpeg/.png/.webp` 元数据旁挂。
-   - 先通过 `POST /api/v1/files/115/folder` 逐级确保独立子目录（如 `/未整理/mp-router/<标题>_tmdb<id>_s<季>_<run_id>`），再调用 `POST /api/v1/share-transfer/receive` 接收视频和字幕旁挂。
+   - 先通过 `POST /api/v1/files/115/folder` 逐级确保独立子目录（如 `/mv_staging/<标题>_tmdb<id>_s<季>_<run_id>`），再调用 `POST /api/v1/share-transfer/receive` 接收视频和字幕旁挂。
 4. **内封中文字幕门禁（外挂字幕不可替代）**
    - 浏览 staging 目录（支持对 115 转存后的异步落盘执行有界轮询等待，默认最多 6 次、间隔 2 秒）拿到视频的 `file_id` 与内存态 `pickcode`，构造临时 `/redirect` URL 交由 `ffprobe` 探测内封音频流与字幕流（绝不写入日志、通知或持久化数据）。
    - `auto`（默认）：外语音轨每集须含内封中文字幕；中文/国语/粤语音轨可豁免并记录诊断。
    - `required`：每集必须含内封中文字幕。
    - **门禁不通过或 `ffprobe` 缺失**：立即停止在 staging 等待人工复核，**严禁整理、严禁生成 STRM、严禁自动删除已接收的 staging 文件**。
-5. **云盘整理、STRM 生成与订阅收口**
+5. **云盘整理、STRM 生成、本地刮削与局部 Emby 刷新**
    - 调用 `POST /api/v1/organize/transfer`（强制 `copy_non_media=False`），可选调用 `POST /api/v1/strm/generate`（强制 `organize=False`）。
+   - 配置 `local_strm_root` 后，自动从整理结果推导精确的本地 STRM 目录（TV 季目录安全上提至剧集根目录，严禁越界或符号链接逃逸，绝不回退扫描整个 STRM 根），轮询等待落盘后调用 MoviePilot Neo `MediaChain` 执行刮削（`overwrite=False`），随后向 Emby 发送局部路径 `POST /emby/Library/Media/Updated`（严禁全库刷新）。
+   - 后置刮削/刷新与主分流故障隔离：即便刮削或 Emby 刷新失败，也绝不回退 PT 重复下载，而是保留 `routed_ok` 并在诊断与通知中提示人工复核。
    - 全部成功后按配置写入 `SubscribeHistory` 并删除原订阅（派发 `EventType.SubscribeComplete`），或仅保留暂停状态。
 
 ## 关键配置项
@@ -35,9 +37,13 @@
 | `mv_api_key` | Muvyo API Key / Token | 空 |
 | `mv_auth_scheme` | 鉴权头格式 | `x-api-key` / `bearer` |
 | `mv_storage` | 115 存储标识 | `115-default` |
-| `staging_root` | 115 staging 根目录 | `/未整理/mp-router` |
+| `staging_root` | 115 staging 根目录（建议避免 `/未整理` 监控目录与 `-router` 后缀） | `/mv_staging` |
 | `cloud_organize_root` | 云盘整理根目录（不得为 STRM 路径，不得追加 `/series`） | `/已整理` |
 | `mv3_strm_root` | 明确 STRM 侧路径（裸 `/series` 会被拒绝） | `/strm` |
+| `local_strm_root` | MoviePilot 容器内可见的本地 STRM 根目录（留空跳过刮削与 Emby 刷新） | `/example-strm`（默认空） |
+| `emby_strm_root` | Emby 容器内看到的 STRM 根目录（可选，留空同 `local_strm_root`） | `/example-emby-strm`（默认空） |
+| `auto_scrape_strm` | 整理成功后自动对精确 STRM 目录执行 MoviePilot 刮削 | `true` |
+| `auto_refresh_emby` | 刮削后向 Emby 发送局部路径更新通知（严禁全库刷新） | `true` |
 | `subtitle_policy` | 内封中文字幕门禁策略 | `auto` / `required` |
 | `on_subtitle_gate_fail` | 字幕门禁失败时的订阅动作（不删云盘文件） | `keep_paused` / `fallback_pt` |
 | `on_success_action` | 分流成功后订阅动作 | `complete` / `pause` |

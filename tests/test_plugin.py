@@ -107,8 +107,9 @@ class TestPluginLifecycle(unittest.TestCase):
         package_path = Path(__file__).resolve().parents[1] / "package.v2.json"
         manifest = json.loads(package_path.read_text(encoding="utf-8"))
         entry = manifest["MuvyoSubscribeRouter"]
-        self.assertEqual(MuvyoSubscribeRouter.plugin_version, "0.2.1")
+        self.assertEqual(MuvyoSubscribeRouter.plugin_version, "0.3.0")
         self.assertEqual(entry["version"], MuvyoSubscribeRouter.plugin_version)
+        self.assertIn("v0.3.0", entry["history"])
         self.assertIn("v0.2.1", entry["history"])
         self.assertIn("v0.2", entry["history"])
         self.assertIn("v0.1", entry["history"])
@@ -1121,6 +1122,294 @@ class TestPluginLifecycle(unittest.TestCase):
             self.assertEqual(len(fake_oper_normal.histories), 1)
             self.assertEqual(fake_oper_normal.histories[0]["name"], normal_title)
             self.assertEqual(fake_oper_normal.histories[0]["description"], "正常简介内容")
+
+    def test_v030_defaults_backward_compat_and_api_health_warnings(self) -> None:
+        plugin = MuvyoSubscribeRouter()
+        _, defaults = plugin.get_form()
+        self.assertEqual(defaults["staging_root"], "/mv_staging")
+        self.assertEqual(defaults["local_strm_root"], "")
+        self.assertEqual(defaults["emby_strm_root"], "")
+        self.assertTrue(defaults["auto_scrape_strm"])
+        self.assertTrue(defaults["auto_refresh_emby"])
+
+        # Old config without new v0.3.0 keys loads cleanly and reports non-blocking staging warnings
+        legacy = self._make_plugin(staging_root="/未整理/mp-router")
+        self.addCleanup(legacy.stop_service)
+        self.assertEqual(legacy._local_strm_root, "")
+        self.assertTrue(legacy._auto_scrape_strm)
+        self.assertTrue(legacy._auto_refresh_emby)
+        with patch.object(plugin_mod.MuvyoClient, "health_check", return_value={"ok": True, "status": 200}):
+            hc = legacy.api_health()
+        self.assertTrue(hc["ok"])
+        self.assertEqual(hc["path_errors"], [])
+        self.assertIn("staging_root_under_unorganized_monitor_risk", hc["warnings"])
+        self.assertIn("staging_root_contains_router_suffix_risk", hc["warnings"])
+
+        # Invalid local_strm_root fails path_errors in api_health
+        bad = self._make_plugin(staging_root="/mv_staging", local_strm_root="/已整理")
+        self.addCleanup(bad.stop_service)
+        with patch.object(plugin_mod.MuvyoClient, "health_check", return_value={"ok": True, "status": 200}):
+            hc_bad = bad.api_health()
+        self.assertFalse(hc_bad["ok"])
+        self.assertEqual(hc_bad["warnings"], [])
+        self.assertIn("local_strm_root_must_not_be_cloud_media_path", hc_bad["path_errors"])
+
+    def test_scrape_local_strm_dir_degrades_offline_and_calls_media_chain_when_available(self) -> None:
+        plugin = self._make_plugin(staging_root="/mv_staging", local_strm_root="/example-strm")
+        self.addCleanup(plugin.stop_service)
+
+        # Unsafe path blocked before touching host modules
+        unsafe_res = plugin._scrape_local_strm_dir("/已整理/anime/Demo", 890, "tv")
+        self.assertFalse(unsafe_res["ok"])
+        self.assertEqual(unsafe_res["error"], "unsafe_local_strm_target_dir")
+
+        # Offline environment gracefully degrades
+        offline_res = plugin._scrape_local_strm_dir("/example-strm/anime/Demo", 890, "tv")
+        self.assertFalse(offline_res["ok"])
+        self.assertEqual(offline_res["error"], "moviepilot_media_chain_unavailable")
+
+        # Simulated MoviePilot Neo host modules: recognize_media -> obtain_images -> scrape_metadata(overwrite=False, recursive=True)
+        calls: List[tuple] = []
+
+        class _FakeMediaChain:
+            def __init__(self) -> None:
+                pass
+
+            def recognize_media(self, meta=None, mtype=None, tmdbid=None):
+                calls.append(("recognize_media", tmdbid, mtype))
+                if tmdbid == 890:
+                    return {"tmdb_id": 890, "title": "Demo"}
+                return None
+
+            def obtain_images(self, mediainfo=None):
+                calls.append(("obtain_images", mediainfo))
+                return mediainfo
+
+            def recognize_by_path(self, path: str, obtain_images: bool = True):
+                calls.append(("recognize_by_path", path, obtain_images))
+                return {"tmdb_id": 999, "title": "FallbackDemo"}
+
+            def scrape_metadata(self, fileitem=None, meta=None, mediainfo=None, overwrite=True, recursive=False):
+                calls.append(("scrape_metadata", fileitem, overwrite, recursive))
+
+        fake_mods: Dict[str, Any] = {
+            "app": types.ModuleType("app"),
+            "app.chain": types.ModuleType("app.chain"),
+            "app.chain.media": types.ModuleType("app.chain.media"),
+            "app.core": types.ModuleType("app.core"),
+            "app.core.metainfo": types.ModuleType("app.core.metainfo"),
+            "app.schemas": types.ModuleType("app.schemas"),
+        }
+        fake_mods["app.chain.media"].MediaChain = _FakeMediaChain
+        fake_mods["app.core.metainfo"].MetaInfoPath = lambda p: {"path": str(p)}
+        fake_mods["app.schemas"].FileItem = lambda **kw: dict(kw)
+
+        with patch.dict(sys.modules, fake_mods, clear=False):
+            ok_res = plugin._scrape_local_strm_dir("/example-strm/anime/Demo", 890, "tv")
+            self.assertTrue(ok_res["ok"])
+            self.assertEqual(calls[0][0], "recognize_media")
+            self.assertEqual(calls[1][0], "obtain_images")
+            self.assertEqual(calls[2][0], "scrape_metadata")
+            self.assertEqual(calls[2][1]["storage"], "local")
+            self.assertEqual(calls[2][1]["type"], "dir")
+            self.assertFalse(calls[2][2])  # overwrite=False
+            self.assertTrue(calls[2][3])   # recursive=True
+
+            calls.clear()
+            fb_res = plugin._scrape_local_strm_dir("/example-strm/anime/Demo2", 999, "tv")
+            self.assertTrue(fb_res["ok"])
+            self.assertEqual(calls[0][0], "recognize_media")
+            self.assertEqual(calls[1], ("recognize_by_path", "/example-strm/anime/Demo2", True))
+            self.assertEqual(calls[2][0], "scrape_metadata")
+
+    def test_refresh_emby_strm_paths_degrades_offline_and_posts_scoped_updates_only(self) -> None:
+        plugin = self._make_plugin(
+            staging_root="/mv_staging",
+            local_strm_root="/example-strm",
+            emby_strm_root="/example-emby-strm",
+        )
+        self.addCleanup(plugin.stop_service)
+
+        # Non-STRM paths rejected
+        bad_paths_res = plugin._refresh_emby_strm_paths(["/已整理/anime/Demo", "/example-emby-strm"])
+        self.assertFalse(bad_paths_res["ok"])
+        self.assertEqual(bad_paths_res["error"], "no_safe_emby_strm_paths")
+
+        # Offline environment gracefully degrades
+        offline_res = plugin._refresh_emby_strm_paths(["/example-emby-strm/anime/Demo"])
+        self.assertFalse(offline_res["ok"])
+        self.assertEqual(offline_res["error"], "moviepilot_mediaserver_helper_unavailable")
+
+        # Simulated MediaServerHelper with 2 Emby instances (host with & without trailing slash)
+        posted: List[tuple] = []
+
+        class _FakeEmbyInst:
+            def __init__(self, host: str, apikey: str, fail: bool = False) -> None:
+                self._host = host
+                self._apikey = apikey
+                self._fail = fail
+                self.refresh_root_called = False
+
+            def refresh_root_library(self) -> None:
+                self.refresh_root_called = True
+
+            def post_data(self, url: str, data: str = "", headers: Dict[str, str] | None = None):
+                if self._fail:
+                    raise RuntimeError(f"emby err api_key={self._apikey}")
+                posted.append((url, data, headers))
+                return types.SimpleNamespace(status_code=204)
+
+        inst_slash = _FakeEmbyInst("http://emby1.example.local:8096/", "EMBY_SECRET_1")
+        inst_noslash = _FakeEmbyInst("http://emby2.example.local:8096", "EMBY_SECRET_2")
+        inst_fail = _FakeEmbyInst("http://emby3.example.local:8096", "EMBY_SECRET_3", fail=True)
+
+        class _FakeHelper:
+            def get_services(self, type_filter: str = ""):
+                return {
+                    "emby1": types.SimpleNamespace(instance=inst_slash),
+                    "emby2": types.SimpleNamespace(instance=inst_noslash),
+                    "emby3": types.SimpleNamespace(instance=inst_fail),
+                }
+
+        fake_mods: Dict[str, Any] = {
+            "app": types.ModuleType("app"),
+            "app.helper": types.ModuleType("app.helper"),
+            "app.helper.mediaserver": types.ModuleType("app.helper.mediaserver"),
+        }
+        fake_mods["app.helper.mediaserver"].MediaServerHelper = _FakeHelper
+
+        with patch.dict(sys.modules, fake_mods, clear=False):
+            res = plugin._refresh_emby_strm_paths([
+                "/example-emby-strm/anime/Demo",
+                "/example-emby-strm/anime/Demo/Season 01",
+                "/已整理/should_be_filtered",
+            ])
+
+        self.assertFalse(res["ok"])
+        self.assertTrue(res["partial_failure"])
+        self.assertEqual(res["refreshed_services"], 2)
+        self.assertEqual(res["failed_services"], 1)
+        self.assertEqual(res["path_count"], 2)
+        self.assertFalse(inst_slash.refresh_root_called)
+        self.assertFalse(inst_noslash.refresh_root_called)
+        self.assertEqual(posted[0][0], "[HOST]emby/Library/Media/Updated?api_key=[APIKEY]")
+        self.assertEqual(posted[1][0], "[HOST]/emby/Library/Media/Updated?api_key=[APIKEY]")
+        body_obj = json.loads(posted[0][1])
+        self.assertEqual(
+            body_obj,
+            {
+                "Updates": [
+                    {"Path": "/example-emby-strm/anime/Demo", "UpdateType": "Modified"},
+                    {"Path": "/example-emby-strm/anime/Demo/Season 01", "UpdateType": "Modified"},
+                ]
+            },
+        )
+        dumped = json.dumps(res, ensure_ascii=False)
+        self.assertNotIn("EMBY_SECRET_1", dumped)
+        self.assertNotIn("EMBY_SECRET_2", dumped)
+        self.assertNotIn("EMBY_SECRET_3", dumped)
+
+    def test_partial_emby_refresh_204_and_503_triggers_warning_notice_without_pt_fallback(self) -> None:
+        plugin = self._make_plugin(
+            staging_root="/mv_staging",
+            local_strm_root="/example-strm",
+            emby_strm_root="/example-emby-strm",
+            on_success_action="complete",
+            notify=True,
+        )
+        self.addCleanup(plugin.stop_service)
+        plugin._executor = _SyncExecutor()  # type: ignore[assignment]
+
+        class _RespEmbyInst:
+            def __init__(self, host: str, status_code: int) -> None:
+                self._host = host
+                self._status_code = status_code
+
+            def post_data(self, url: str, data: str = "", headers: Dict[str, str] | None = None):
+                return types.SimpleNamespace(status_code=self._status_code)
+
+        class _PartialHelper:
+            def get_services(self, type_filter: str = ""):
+                return {
+                    "emby_ok": types.SimpleNamespace(instance=_RespEmbyInst("http://emby1.example.local:8096/", 204)),
+                    "emby_bad": types.SimpleNamespace(instance=_RespEmbyInst("http://emby2.example.local:8096", 503)),
+                }
+
+        fake_mods: Dict[str, Any] = {
+            "app": types.ModuleType("app"),
+            "app.helper": types.ModuleType("app.helper"),
+            "app.helper.mediaserver": types.ModuleType("app.helper.mediaserver"),
+        }
+        fake_mods["app.helper.mediaserver"].MediaServerHelper = _PartialHelper
+
+        with patch.dict(sys.modules, fake_mods, clear=False):
+            refresh_res = plugin._refresh_emby_strm_paths(["/example-emby-strm/anime/Demo"])
+        self.assertFalse(refresh_res["ok"])
+        self.assertTrue(refresh_res["partial_failure"])
+        self.assertEqual(refresh_res["refreshed_services"], 1)
+        self.assertEqual(refresh_res["failed_services"], 1)
+
+        fake_oper = _FakeSubscribeOper({
+            402: {"id": 402, "name": "双Emby部分失败剧", "type": "电视剧", "season": 1, "tmdbid": 8002, "state": "N"}
+        })
+        media = {"status": "Ended", "last_air_date": "2024-01-01", "season_info": [{"season_number": 1, "episode_count": 4}]}
+        partial_result = PipelineResult(
+            status="routed_ok",
+            reason="muvyo_routed_and_organized",
+            video_count=4,
+            episodes=[1, 2, 3, 4],
+            diagnostics={
+                "warnings": ["emby_refresh_partial_failed"],
+                "post_process": {"emby_refresh_ok": False, "emby_refresh_result": refresh_res},
+            },
+        )
+        with patch.object(plugin_mod, "SubscribeOper", return_value=fake_oper), \
+             patch.object(plugin_mod, "run_muvyo_routing_pipeline", return_value=partial_result), \
+             patch.object(plugin, "post_message") as mock_post:
+            plugin.on_subscribe_added(Event(EventType.SubscribeAdded, {"subscribe_id": 402, "mediainfo": media}))
+
+        self.assertEqual(fake_oper.deleted, [402])
+        mock_post.assert_called_once()
+        self.assertIn("后置告警", mock_post.call_args.kwargs["title"])
+        self.assertIn("emby_refresh_partial_failed", mock_post.call_args.kwargs["text"])
+
+    def test_routed_ok_with_post_process_warning_notifies_user_without_pt_fallback(self) -> None:
+        plugin = self._make_plugin(
+            staging_root="/mv_staging",
+            local_strm_root="/example-strm",
+            on_success_action="complete",
+            notify=True,
+        )
+        self.addCleanup(plugin.stop_service)
+        plugin._executor = _SyncExecutor()  # type: ignore[assignment]
+
+        fake_oper = _FakeSubscribeOper({
+            401: {"id": 401, "name": "告警通知剧", "type": "电视剧", "season": 1, "tmdbid": 8001, "state": "N"}
+        })
+        media = {"status": "Ended", "last_air_date": "2024-01-01", "season_info": [{"season_number": 1, "episode_count": 4}]}
+        ok_with_warn = PipelineResult(
+            status="routed_ok",
+            reason="muvyo_routed_and_organized",
+            video_count=4,
+            episodes=[1, 2, 3, 4],
+            diagnostics={
+                "warnings": ["strm_scrape_failed", "emby_refresh_skipped_scrape_failed"],
+                "post_process": {"scrape_failed": 1, "emby_refresh_ok": None},
+            },
+        )
+
+        with patch.object(plugin_mod, "SubscribeOper", return_value=fake_oper), \
+             patch.object(plugin_mod, "run_muvyo_routing_pipeline", return_value=ok_with_warn) as mock_pipe, \
+             patch.object(plugin, "post_message") as mock_post:
+            plugin.on_subscribe_added(Event(EventType.SubscribeAdded, {"subscribe_id": 401, "mediainfo": media}))
+
+        # Subscribe is completed (not restored to PT) and runners were injected
+        self.assertEqual(fake_oper.deleted, [401])
+        self.assertIn("scrape_runner", mock_pipe.call_args.kwargs)
+        self.assertIn("emby_refresh_runner", mock_pipe.call_args.kwargs)
+        mock_post.assert_called_once()
+        self.assertIn("后置告警", mock_post.call_args.kwargs["title"])
+        self.assertIn("人工复核", mock_post.call_args.kwargs["text"])
 
 
 if __name__ == "__main__":

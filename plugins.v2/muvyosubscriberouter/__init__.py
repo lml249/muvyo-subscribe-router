@@ -1,15 +1,28 @@
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .client import MuvyoClient
 from .completion import CompletionDecision, evaluate_subscription_completion
-from .pipeline import RouterPipelineConfig, run_muvyo_routing_pipeline, validate_router_paths
+from .pipeline import (
+    RouterPipelineConfig,
+    _has_dot_segments,
+    inspect_staging_root_warnings,
+    is_path_strictly_within_root,
+    is_pure_category_rel_path,
+    looks_like_cloud_media_path,
+    looks_like_strm_side_path,
+    normalize_cloud_path,
+    run_muvyo_routing_pipeline,
+    validate_router_paths,
+)
 from .redaction import redact_exception, redact_sensitive_data, redact_sensitive_text
 
 try:
@@ -156,9 +169,9 @@ def _now_iso() -> str:
 
 class MuvyoSubscribeRouter(_PluginBase):
     plugin_name = "Muvyo 完结订阅分流"
-    plugin_desc = "监听 MoviePilot 新增订阅，对已完结剧集（及可选电影）优先通过外置 Muvyo/MV3 盘搜、115 转存、内封中文字幕门禁与整理生成 STRM，失败无缝回退 PT。"
+    plugin_desc = "监听 MoviePilot 新增订阅，对已完结剧集（及可选电影）优先通过外置 Muvyo/MV3 盘搜、115 转存、内封中文字幕门禁、云盘整理与 STRM 刮削/局部 Emby 刷新，失败无缝回退 PT。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/cloud.png"
-    plugin_version = "0.2.1"
+    plugin_version = "0.3.0"
     plugin_author = "lml249"
     author_url = "https://github.com/lml249/muvyo-subscribe-router"
     plugin_config_prefix = "muvyosubscriberouter_"
@@ -180,9 +193,13 @@ class MuvyoSubscribeRouter(_PluginBase):
         self._latest_season_quiet_days: int = 30
         self._user_allowlist: List[str] = []
         self._user_blocklist: List[str] = []
-        self._staging_root: str = "/未整理/mp-router"
+        self._staging_root: str = "/mv_staging"
         self._cloud_organize_root: str = "/已整理"
         self._mv3_strm_root: str = "/strm"
+        self._local_strm_root: str = ""
+        self._emby_strm_root: str = ""
+        self._auto_scrape_strm: bool = True
+        self._auto_refresh_emby: bool = True
         self._subtitle_policy: str = "auto"
         self._ffprobe_binary: str = ""
         self._ffprobe_timeout: int = 45
@@ -228,9 +245,13 @@ class MuvyoSubscribeRouter(_PluginBase):
         self._latest_season_quiet_days = max(7, min(365, quiet_days))
         self._user_allowlist = _split_csv(cfg.get("user_allowlist"))
         self._user_blocklist = _split_csv(cfg.get("user_blocklist"))
-        self._staging_root = str(cfg.get("staging_root") or "/未整理/mp-router").strip()
+        self._staging_root = str(cfg.get("staging_root") or "/mv_staging").strip()
         self._cloud_organize_root = str(cfg.get("cloud_organize_root") or "/已整理").strip()
         self._mv3_strm_root = str(cfg.get("mv3_strm_root") or "/strm").strip()
+        self._local_strm_root = str(cfg.get("local_strm_root") or "").strip()
+        self._emby_strm_root = str(cfg.get("emby_strm_root") or "").strip()
+        self._auto_scrape_strm = _parse_bool(cfg.get("auto_scrape_strm"), True)
+        self._auto_refresh_emby = _parse_bool(cfg.get("auto_refresh_emby"), True)
         pol = str(cfg.get("subtitle_policy") or "auto").strip().lower()
         self._subtitle_policy = pol if pol in {"auto", "required"} else "auto"
         self._ffprobe_binary = str(cfg.get("ffprobe_binary") or "").strip()
@@ -329,13 +350,30 @@ class MuvyoSubscribeRouter(_PluginBase):
                         "component": "VRow",
                         "content": [
                             {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
-                                {"component": "VTextField", "props": {"model": "staging_root", "label": "115 Staging 根目录", "placeholder": "/未整理/mp-router"}}
+                                {"component": "VTextField", "props": {"model": "staging_root", "label": "115 Staging 根目录", "placeholder": "/mv_staging"}}
                             ]},
                             {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
                                 {"component": "VTextField", "props": {"model": "cloud_organize_root", "label": "云盘整理根（勿追加 /series）", "placeholder": "/已整理"}}
                             ]},
                             {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
                                 {"component": "VTextField", "props": {"model": "mv3_strm_root", "label": "明确 STRM 根（勿填裸 /series）", "placeholder": "/strm"}}
+                            ]},
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
+                                {"component": "VTextField", "props": {"model": "local_strm_root", "label": "本地 STRM 根目录（留空跳过刮削）", "placeholder": "/example-strm"}}
+                            ]},
+                            {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
+                                {"component": "VTextField", "props": {"model": "emby_strm_root", "label": "Emby STRM 根目录（留空同本地 STRM）", "placeholder": "/example-emby-strm"}}
+                            ]},
+                            {"component": "VCol", "props": {"cols": 12, "md": 2}, "content": [
+                                {"component": "VSwitch", "props": {"model": "auto_scrape_strm", "label": "整理后自动刮削 STRM"}}
+                            ]},
+                            {"component": "VCol", "props": {"cols": 12, "md": 2}, "content": [
+                                {"component": "VSwitch", "props": {"model": "auto_refresh_emby", "label": "刮削后局部刷新 Emby"}}
                             ]},
                         ],
                     },
@@ -421,9 +459,13 @@ class MuvyoSubscribeRouter(_PluginBase):
             "latest_season_quiet_days": 30,
             "user_allowlist": "",
             "user_blocklist": "",
-            "staging_root": "/未整理/mp-router",
+            "staging_root": "/mv_staging",
             "cloud_organize_root": "/已整理",
             "mv3_strm_root": "/strm",
+            "local_strm_root": "",
+            "emby_strm_root": "",
+            "auto_scrape_strm": True,
+            "auto_refresh_emby": True,
             "subtitle_policy": "auto",
             "ffprobe_binary": "",
             "ffprobe_timeout": 45,
@@ -628,6 +670,10 @@ class MuvyoSubscribeRouter(_PluginBase):
             staging_root=self._staging_root,
             cloud_organize_root=self._cloud_organize_root,
             mv3_strm_root=self._mv3_strm_root,
+            local_strm_root=self._local_strm_root,
+            emby_strm_root=self._emby_strm_root,
+            auto_scrape_strm=self._auto_scrape_strm,
+            auto_refresh_emby=self._auto_refresh_emby,
             subtitle_policy=self._subtitle_policy,
             ffprobe_binary=self._ffprobe_binary,
             ffprobe_timeout=self._ffprobe_timeout,
@@ -637,6 +683,174 @@ class MuvyoSubscribeRouter(_PluginBase):
             max_drill_depth=self._max_drill_depth,
             trigger_strm_generate=self._trigger_strm_generate,
             dry_run=self._dry_run if dry_run_override is None else bool(dry_run_override),
+        )
+
+    def _scrape_local_strm_dir(self, target_dir: str, tmdb_id: int, media_kind: str) -> Dict[str, Any]:
+        norm_target = normalize_cloud_path(target_dir)
+        norm_root = normalize_cloud_path(self._local_strm_root)
+        rel_target = (
+            norm_target[len(norm_root) + 1:].strip("/")
+            if (norm_root and norm_target.startswith(norm_root + "/"))
+            else ""
+        )
+        if (
+            not norm_target
+            or not norm_root
+            or not rel_target
+            or is_pure_category_rel_path(rel_target)
+            or looks_like_cloud_media_path(norm_target)
+            or not looks_like_strm_side_path(norm_target)
+            or not is_path_strictly_within_root(target_dir, self._local_strm_root)
+        ):
+            return {"ok": False, "error": "unsafe_local_strm_target_dir"}
+
+        try:
+            from app.chain.media import MediaChain
+            from app.core.metainfo import MetaInfoPath
+            from app.schemas import FileItem
+        except ImportError:
+            return {"ok": False, "error": "moviepilot_media_chain_unavailable"}
+
+        try:
+            target_path = Path(target_dir)
+            meta_info = MetaInfoPath(target_path)
+            mtype = MediaType.MOVIE if str(media_kind or "").strip().lower() == "movie" else MediaType.TV
+            chain = MediaChain()
+            media_info = chain.recognize_media(meta=meta_info, mtype=mtype, tmdbid=int(tmdb_id))
+            if media_info is not None:
+                obtained = chain.obtain_images(mediainfo=media_info)
+                if obtained is not None:
+                    media_info = obtained
+            else:
+                media_info = chain.recognize_by_path(target_dir, obtain_images=True)
+
+            if media_info is None:
+                return {"ok": False, "error": "media_recognize_failed"}
+
+            fileitem = FileItem(
+                storage="local",
+                type="dir",
+                path=target_dir,
+                name=target_path.name,
+            )
+            chain.scrape_metadata(
+                fileitem=fileitem,
+                meta=meta_info,
+                mediainfo=media_info,
+                overwrite=False,
+                recursive=True,
+            )
+            return {
+                "ok": True,
+                "target_dir": target_dir,
+                "tmdb_id": int(tmdb_id),
+            }
+        except Exception as exc:
+            return {
+                "ok": False,
+                "error": redact_exception(exc, extra_secrets=[self._mv_api_key]),
+            }
+
+    def _refresh_emby_strm_paths(self, emby_paths: List[str]) -> Dict[str, Any]:
+        effective_root = normalize_cloud_path(self._emby_strm_root) or normalize_cloud_path(self._local_strm_root)
+        norm_local_root = normalize_cloud_path(self._local_strm_root)
+        safe_paths: List[str] = []
+        seen: set[str] = set()
+        for raw_path in emby_paths or []:
+            raw = str(raw_path or "").strip()
+            if not raw or _has_dot_segments(raw):
+                continue
+            norm = normalize_cloud_path(raw)
+            if not norm or looks_like_cloud_media_path(norm) or not looks_like_strm_side_path(norm):
+                continue
+            if effective_root:
+                if norm == effective_root or not norm.startswith(effective_root + "/"):
+                    continue
+                rel = norm[len(effective_root) + 1:].strip("/")
+                if not rel or is_pure_category_rel_path(rel):
+                    continue
+                if norm_local_root:
+                    mapped_local = f"{norm_local_root}/{rel}"
+                    if not is_path_strictly_within_root(mapped_local, self._local_strm_root):
+                        continue
+            if norm not in seen:
+                seen.add(norm)
+                safe_paths.append(norm)
+
+        if not safe_paths:
+            return {"ok": False, "error": "no_safe_emby_strm_paths"}
+
+        try:
+            from app.helper.mediaserver import MediaServerHelper
+        except ImportError:
+            return {"ok": False, "error": "moviepilot_mediaserver_helper_unavailable"}
+
+        try:
+            services = MediaServerHelper().get_services(type_filter="emby")
+        except Exception as exc:
+            return {
+                "ok": False,
+                "error": redact_exception(exc, extra_secrets=[self._mv_api_key]),
+            }
+
+        if not services:
+            return {"ok": False, "error": "no_emby_service_configured"}
+
+        service_items = list(services.items()) if isinstance(services, dict) else [
+            (str(idx), svc) for idx, svc in enumerate(services)
+        ]
+        payload_str = json.dumps(
+            {"Updates": [{"Path": p, "UpdateType": "Modified"} for p in safe_paths]},
+            ensure_ascii=False,
+        )
+        headers = {"Content-Type": "application/json"}
+        succeeded = 0
+        failed = 0
+        errors: List[str] = []
+        extra_secrets: List[str] = [self._mv_api_key]
+
+        for svc_name, service in service_items:
+            inst = getattr(service, "instance", None)
+            if inst is None or not hasattr(inst, "post_data"):
+                continue
+            inst_apikey = str(getattr(inst, "_apikey", "") or "")
+            if inst_apikey:
+                extra_secrets.append(inst_apikey)
+            host = str(getattr(inst, "_host", "") or "").strip()
+            url = (
+                "[HOST]emby/Library/Media/Updated?api_key=[APIKEY]"
+                if host.endswith("/")
+                else "[HOST]/emby/Library/Media/Updated?api_key=[APIKEY]"
+            )
+            try:
+                resp = inst.post_data(url, data=payload_str, headers=headers)
+            except Exception as exc:
+                failed += 1
+                errors.append(
+                    f"{svc_name}:{redact_exception(exc, extra_secrets=extra_secrets)}"
+                )
+                continue
+
+            status_code = getattr(resp, "status_code", None)
+            if resp is None or (isinstance(status_code, int) and status_code >= 400):
+                failed += 1
+                errors.append(f"{svc_name}:http_{status_code if status_code is not None else 'none'}")
+            else:
+                succeeded += 1
+
+        if succeeded == 0 and failed == 0:
+            return {"ok": False, "error": "no_emby_service_instance_available"}
+
+        return redact_sensitive_data(
+            {
+                "ok": succeeded > 0 and failed == 0,
+                "partial_failure": succeeded > 0 and failed > 0,
+                "refreshed_services": succeeded,
+                "failed_services": failed,
+                "path_count": len(safe_paths),
+                "errors": errors,
+            },
+            extra_secrets=extra_secrets,
         )
 
     def _user_allowed(self, username: str) -> bool:
@@ -1021,13 +1235,19 @@ class MuvyoSubscribeRouter(_PluginBase):
 
             client = self._build_client()
             cfg = self._build_pipeline_config()
+            pipeline_kwargs: Dict[str, Any] = {
+                "tmdb_id": tmdb_id,
+                "config": cfg,
+                "run_id": f"sub{subscribe_id}_{int(time.time())}",
+                "should_stop": worker_stopped,
+            }
+            if cfg.local_strm_root and (cfg.auto_scrape_strm or cfg.auto_refresh_emby):
+                pipeline_kwargs["scrape_runner"] = self._scrape_local_strm_dir
+                pipeline_kwargs["emby_refresh_runner"] = self._refresh_emby_strm_paths
             result = run_muvyo_routing_pipeline(
                 client,
                 decision,
-                tmdb_id=tmdb_id,
-                config=cfg,
-                run_id=f"sub{subscribe_id}_{int(time.time())}",
-                should_stop=worker_stopped,
+                **pipeline_kwargs,
             )
             record = {
                 "timestamp": _now_iso(),
@@ -1062,10 +1282,26 @@ class MuvyoSubscribeRouter(_PluginBase):
                 if not ok_complete and comp_reason == "aborted_stopped":
                     return
                 if ok_complete:
-                    self._send_notice(
-                        f"Muvyo 分流成功：{decision.title}",
-                        f"订阅 #{subscribe_id} 已完成 115 转存、内封中文字幕门禁与云盘整理（共 {result.video_count} 个视频）。",
+                    diag = result.diagnostics if isinstance(result.diagnostics, dict) else {}
+                    warnings = [str(w) for w in (diag.get("warnings") or []) if w]
+                    post_proc = diag.get("post_process") if isinstance(diag.get("post_process"), dict) else {}
+                    has_post_issue = (
+                        bool(warnings)
+                        or int(post_proc.get("scrape_failed") or 0) > 0
+                        or post_proc.get("emby_refresh_ok") is False
                     )
+                    if has_post_issue:
+                        warn_summary = ", ".join(warnings[:5]) if warnings else "post_process_partial_failure"
+                        self._send_notice(
+                            f"Muvyo 分流成功（含后置告警）：{decision.title}",
+                            f"订阅 #{subscribe_id} 已完成 115 转存、内封中文字幕门禁与云盘整理（共 {result.video_count} 个视频），"
+                            f"但后置刮削/刷新存在告警（{warn_summary}），请人工复核海报与元数据。",
+                        )
+                    else:
+                        self._send_notice(
+                            f"Muvyo 分流成功：{decision.title}",
+                            f"订阅 #{subscribe_id} 已完成 115 转存、内封中文字幕门禁与云盘整理（共 {result.video_count} 个视频）。",
+                        )
                 else:
                     self._send_notice(
                         f"Muvyo 分流已整理但订阅收口异常：{decision.title}",
@@ -1125,13 +1361,19 @@ class MuvyoSubscribeRouter(_PluginBase):
 
     def api_health(self) -> Dict[str, Any]:
         path_errors = validate_router_paths(
-            self._staging_root, self._cloud_organize_root, self._mv3_strm_root
+            self._staging_root,
+            self._cloud_organize_root,
+            self._mv3_strm_root,
+            local_strm_root=self._local_strm_root,
+            emby_strm_root=self._emby_strm_root,
         )
+        warnings = inspect_staging_root_warnings(self._staging_root)
         if not self._mv_base_url:
             return redact_sensitive_data({
                 "ok": False,
                 "configured": False,
                 "path_errors": path_errors,
+                "warnings": warnings,
                 "error": "mv_base_url_not_configured",
             })
         hc = self._build_client().health_check()
@@ -1140,6 +1382,7 @@ class MuvyoSubscribeRouter(_PluginBase):
             "configured": True,
             "health": hc,
             "path_errors": path_errors,
+            "warnings": warnings,
         })
 
     def api_dry_run(self, payload: Optional[Dict[str, Any]] = Body(default=None)) -> Dict[str, Any]:

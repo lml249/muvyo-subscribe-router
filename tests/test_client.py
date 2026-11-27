@@ -312,6 +312,114 @@ class TestRedactionAndClient(unittest.TestCase):
         self.assertEqual(res["final_folder_id"], "dir_real_123")
         self.assertEqual(res["steps"][0]["action"], "reused")
 
+    def test_organize_transfer_extracts_scoped_resolved_strm_dirs(self) -> None:
+        def _transport(method: str, url: str, headers: Dict[str, str], body: Optional[bytes], timeout: int):
+            return 200, {}, json.dumps({
+                "success": True,
+                "data": {
+                    "success": 2,
+                    "failed": 0,
+                    "skipped": 0,
+                    "strm_dir": "/strm/anime/DemoShow (1995)/Season 01",
+                    "items": [
+                        {
+                            "old_path": "/mv_staging/e1.mkv",
+                            "new_path": "/已整理/anime/DemoShow (1995)/Season 01/e1.mkv",
+                            "strm_path": "/strm/anime/DemoShow (1995)/Season 01/e1.strm",
+                            "status": "ok",
+                        },
+                        {
+                            "old_path": "/mv_staging/e2.mkv",
+                            "new_path": "/已整理/anime/DemoShow (1995)/Season 01/e2.mkv",
+                            "strm_dir": "/strm/anime/DemoShow (1995)/Season 01",
+                            "status": "ok",
+                        },
+                        {
+                            "old_path": "/mv_staging/bad.mkv",
+                            "new_path": "/已整理/anime/DemoShow (1995)/Season 01/bad.mkv",
+                            "strm_path": "/other/escape/bad.strm",
+                            "strm_dir": "/strm/../escape",
+                            "status": "ok",
+                        },
+                    ],
+                },
+            }).encode()
+
+        client = MuvyoClient("http://mv3.example.local:7811", api_key="k", transport=_transport)
+        res = client.organize_transfer(
+            files=[
+                {"name": "e1.mkv", "source_path": "/mv_staging/e1.mkv"},
+                {"name": "e2.mkv", "source_path": "/mv_staging/e2.mkv"},
+            ],
+            target_dir="/已整理",
+            strm_dir="/strm",
+            tmdb_id=890,
+        )
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["resolved_strm_dirs"], ["/strm/anime/DemoShow (1995)/Season 01"])
+        self.assertEqual(res["resolved_target_dirs"], ["/已整理/anime/DemoShow (1995)/Season 01"])
+
+    def test_organize_transfer_filters_pure_category_strm_dirs_and_prefers_item_paths(self) -> None:
+        # 1) Items have file-level strm_path while top-level strm_dir is multi-level category /strm/series/anime
+        def _transport_with_items(method: str, url: str, headers: Dict[str, str], body: Optional[bytes], timeout: int):
+            return 200, {}, json.dumps({
+                "success": True,
+                "data": {
+                    "success": 1,
+                    "failed": 0,
+                    "skipped": 0,
+                    "strm_dir": "/strm/series/anime",
+                    "items": [
+                        {
+                            "old_path": "/mv_staging/e1.mkv",
+                            "new_path": "/已整理/series/anime/DemoShow/Season 01/e1.mkv",
+                            "strm_path": "/strm/series/anime/DemoShow/Season 01/e1.strm",
+                            "status": "ok",
+                        }
+                    ],
+                },
+            }).encode()
+
+        client1 = MuvyoClient("http://mv3.example.local:7811", api_key="k", transport=_transport_with_items)
+        res1 = client1.organize_transfer(
+            files=[{"name": "e1.mkv", "source_path": "/mv_staging/e1.mkv"}],
+            target_dir="/已整理",
+            strm_dir="/strm",
+            tmdb_id=890,
+        )
+        self.assertTrue(res1["ok"])
+        self.assertEqual(res1["resolved_strm_dirs"], ["/strm/series/anime/DemoShow/Season 01"])
+
+        # 2) Top-level strm_dir is pure category (/strm/anime) and items lack strm_path -> resolved_strm_dirs stays empty
+        def _transport_top_cat_only(method: str, url: str, headers: Dict[str, str], body: Optional[bytes], timeout: int):
+            return 200, {}, json.dumps({
+                "success": True,
+                "data": {
+                    "success": 1,
+                    "failed": 0,
+                    "skipped": 0,
+                    "strm_dir": "/strm/anime",
+                    "items": [
+                        {
+                            "old_path": "/mv_staging/e1.mkv",
+                            "new_path": "/已整理/anime/DemoShow/Season 01/e1.mkv",
+                            "status": "ok",
+                        }
+                    ],
+                },
+            }).encode()
+
+        client2 = MuvyoClient("http://mv3.example.local:7811", api_key="k", transport=_transport_top_cat_only)
+        res2 = client2.organize_transfer(
+            files=[{"name": "e1.mkv", "source_path": "/mv_staging/e1.mkv"}],
+            target_dir="/已整理",
+            strm_dir="/strm",
+            tmdb_id=890,
+        )
+        self.assertTrue(res2["ok"])
+        self.assertEqual(res2["resolved_strm_dirs"], [])
+        self.assertEqual(res2["resolved_target_dirs"], ["/已整理/anime/DemoShow/Season 01"])
+
 
 if __name__ == "__main__":
     unittest.main()
